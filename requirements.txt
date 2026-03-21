@@ -1,0 +1,10 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pdfplumber>=0.10.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dateutil>=2.9.0
+python-multipart>=0.0.9
+# For Kotak Credit Card OCR (install Ghostscript 10.x + Tesseract 5.x separately)
+pytesseract>=0.3.10
+Pillow>=10.0.0
