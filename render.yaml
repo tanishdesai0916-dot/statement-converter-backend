@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: statement-converter-backend
+    runtime: python
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python backend.py   # change if needed
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
+
+    aptPackages:
+      - ghostscript
+      - tesseract-ocr
