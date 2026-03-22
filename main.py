@@ -81,36 +81,43 @@ app.add_middleware(
 # ── JWT / Auth helpers ────────────────────────────────────────────────────────
 from fastapi import Request
 
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+def _env_clean(name: str, default: str = "") -> str:
+    value = os.environ.get(name, default)
+    if not isinstance(value, str):
+        return default
+    return value.strip().strip('"').strip("'").strip() or default
+
+
+SUPABASE_JWT_SECRET = _env_clean("SUPABASE_JWT_SECRET")
+SUPABASE_URL = _env_clean(
+    "SUPABASE_URL",
+    _env_clean("VITE_SUPABASE_URL", "https://tfkqovfodkstoqjhqegv.supabase.co"),
+)
+SUPABASE_PUBLISHABLE_KEY = _env_clean(
+    "SUPABASE_PUBLISHABLE_KEY",
+    _env_clean(
+        "VITE_SUPABASE_PUBLISHABLE_KEY",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRma3FvdmZvZGtzdG9xamhxZWd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwOTYzNzMsImV4cCI6MjA4OTY3MjM3M30.xIHyzzsaz4wnw9KvRycc-I9lOhoYvtgID9Id7Qj4uZw",
+    ),
+)
+SUPABASE_SERVICE_ROLE_KEY = _env_clean("SUPABASE_SERVICE_ROLE_KEY", _env_clean("VITE_SUPABASE_SERVICE_ROLE_KEY"))
 
 def _get_current_user(request: Request) -> dict:
     """Validate JWT and return user claims. Raises HTTPException on failure."""
     auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
+    parts = auth_header.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
         raise HTTPException(401, "Missing or invalid Authorization header")
-    token = auth_header.replace("Bearer ", "")
+    token = parts[1].strip()
 
-    # 1) Try local JWT verification first (fast path)
-    try:
-        from jose import jwt as _jwt
-        payload = _jwt.decode(
-            token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
-            audience="authenticated",
-            options={"verify_signature": bool(SUPABASE_JWT_SECRET)}
-        )
-        return payload
-    except Exception:
-        pass
-
-    # 2) Fallback: verify token with Auth API (works even if signing key/algorithm changed)
-    supabase_url = os.environ.get("SUPABASE_URL", "")
-    verify_key = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-    if supabase_url and verify_key:
+    # 1) Primary verification via Auth API (resilient to key/algorithm mismatch)
+    verify_key = SUPABASE_PUBLISHABLE_KEY or SUPABASE_SERVICE_ROLE_KEY
+    if SUPABASE_URL and verify_key:
         import json as _json
         import urllib.error
         import urllib.request
 
-        verify_url = f"{supabase_url}/auth/v1/user"
+        verify_url = f"{SUPABASE_URL}/auth/v1/user"
         verify_req = urllib.request.Request(
             verify_url,
             headers={
@@ -131,14 +138,26 @@ def _get_current_user(request: Request) -> dict:
                     "email": user.get("email"),
                     "aud": "authenticated",
                 }
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                raise HTTPException(401, "Invalid or expired token")
-            raise HTTPException(500, "Authentication service error")
-        except HTTPException:
-            raise
         except Exception:
-            raise HTTPException(500, "Authentication service unavailable")
+            # Fall through to local verification below
+            pass
+
+    # 2) Local JWT verification fallback (requires configured secret)
+    if SUPABASE_JWT_SECRET:
+        try:
+            from jose import jwt as _jwt
+
+            payload = _jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                options={"verify_aud": False},
+            )
+            if not payload.get("sub"):
+                raise ValueError("JWT missing sub claim")
+            return payload
+        except Exception:
+            pass
 
     raise HTTPException(401, "Invalid or expired token")
 
@@ -153,8 +172,8 @@ def _require_admin(request: Request) -> dict:
     if not user_id:
         raise HTTPException(403, "Admin role required")
 
-    supabase_url = os.environ.get("SUPABASE_URL", "")
-    service_role_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    supabase_url = SUPABASE_URL
+    service_role_key = SUPABASE_SERVICE_ROLE_KEY
     if not supabase_url or not service_role_key:
         raise HTTPException(500, "Server misconfigured: missing Supabase credentials")
 
