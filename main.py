@@ -54,7 +54,7 @@ else:
     TESSERACT_EXE = shutil.which("tesseract") or "tesseract"
     GS_EXE        = shutil.which("gs") or "gs"
 
-OCR_DPI       = 600
+OCR_DPI       = 400
 MIN_ROWS      = 3
 
 INPUT_DIR  = Path(__file__).parent / "input"
@@ -599,16 +599,21 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
         cmd = [GS_EXE, "-dSAFER", "-dBATCH", "-dNOPAUSE", f"-r{OCR_DPI}",
-               "-sDEVICE=png16m", f"-sOutputFile={out_pattern}"]
+               "-sDEVICE=pnggray", f"-sOutputFile={out_pattern}",
+               "-dNumRenderingThreads=1", "-dBufferSpace=100000"]
         if password:
             cmd.append(f"-sPDFPassword={password}")
         cmd.append(pdf_path)
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=90)
 
         pages_text = []
         for fn in sorted(f for f in os.listdir(tmp) if f.endswith(".png")):
             img = Image.open(os.path.join(tmp, fn))
-            pages_text.append(pytesseract.image_to_string(img, config="--oem 3 --psm 4") or "")
+            text = pytesseract.image_to_string(img, config="--oem 3 --psm 4") or ""
+            pages_text.append(text)
+            img.close()
+            del img
+            gc.collect()
         return pages_text
 
 
