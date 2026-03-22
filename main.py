@@ -43,8 +43,16 @@ except ImportError:
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-GS_EXE        = r"C:\Program Files\gs\gs10.06.0\bin\gswin64c.exe"
+import platform
+
+if platform.system() == "Windows":
+    TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    GS_EXE        = r"C:\Program Files\gs\gs10.06.0\bin\gswin64c.exe"
+else:
+    # Linux / macOS (Render, Docker, etc.)
+    TESSERACT_EXE = "tesseract"
+    GS_EXE        = "gs"
+
 OCR_DPI       = 600
 MIN_ROWS      = 3
 
@@ -60,13 +68,80 @@ LARGE_PDF_PAGE_THRESHOLD = 10  # warn above this many pages
 
 app = FastAPI(title="StatementIQ API", version="1.0.0")
 
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── JWT / Auth helpers ────────────────────────────────────────────────────────
+from fastapi import Request
+
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+
+def _get_current_user(request: Request) -> dict:
+    """Validate Supabase JWT and return decoded claims. Raises HTTPException on failure."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header")
+    token = auth_header.replace("Bearer ", "")
+    try:
+        from jose import jwt as _jwt
+        payload = _jwt.decode(
+            token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
+            audience="authenticated",
+            options={"verify_signature": bool(SUPABASE_JWT_SECRET)}
+        )
+        return payload
+    except Exception:
+        raise HTTPException(401, "Invalid or expired token")
+
+
+def _require_admin(request: Request) -> dict:
+    """Validate JWT and verify the caller has the 'admin' role. Raises 403 if not."""
+    import json as _json
+    import urllib.request
+
+    user = _get_current_user(request)
+    user_id = user.get("sub", "")
+    if not user_id:
+        raise HTTPException(403, "Admin role required")
+
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    service_role_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not service_role_key:
+        raise HTTPException(500, "Server misconfigured: missing Supabase credentials")
+
+    url = (
+        f"{supabase_url}/rest/v1/user_roles"
+        f"?user_id=eq.{user_id}&role=eq.admin&select=id"
+    )
+    req = urllib.request.Request(url, headers={
+        "apikey": service_role_key,
+        "Authorization": f"Bearer {service_role_key}",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            rows = _json.loads(resp.read())
+            if not rows:
+                raise HTTPException(403, "Admin role required")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(500, "Failed to verify admin role")
+
+    return user
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize a user-provided filename to prevent path traversal."""
+    basename = os.path.basename(filename)
+    return re.sub(r"[^\w.\-]", "_", basename)
 
 # =============================================================================
 # SHARED UTILITIES
@@ -1130,11 +1205,13 @@ def add_axis_total_row(df: pd.DataFrame) -> pd.DataFrame:
 
 @app.post("/convert")
 async def convert(
+    request: Request,
     file: UploadFile = File(...),
     mode: str = Form(...),          # "pms" | "kotak" | "aif" | "axis" | "hdfc" | "icici"
     sub_mode: str = Form(""),       # "bank" | "cc" (only for kotak)
     password: Optional[str] = Form(None),
 ):
+    _get_current_user(request)  # require authentication
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
 
@@ -1144,7 +1221,8 @@ async def convert(
     # ── File size info (no rejection, just log) ────────────────────────
     size_mb = len(content) / (1024 * 1024)
 
-    input_path = INPUT_DIR / file.filename
+    safe_name = _sanitize_filename(file.filename)
+    input_path = INPUT_DIR / safe_name
     input_path.write_bytes(content)
     tmp_path = str(input_path)
 
@@ -1386,15 +1464,18 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
 
 @app.post("/extract-text")
 async def extract_text(
+    request: Request,
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
 ):
+    _get_current_user(request)  # require authentication
     """Extract raw text from each page of a PDF for the Custom Format Builder."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
 
     content = await file.read()
-    input_path = INPUT_DIR / file.filename
+    safe_name = _sanitize_filename(file.filename)
+    input_path = INPUT_DIR / safe_name
     input_path.write_bytes(content)
     tmp_path = str(input_path)
 
@@ -1417,10 +1498,12 @@ import json
 
 @app.post("/custom-convert")
 async def custom_convert(
+    request: Request,
     file: UploadFile = File(...),
     config_json: str = Form(...),
     password: Optional[str] = Form(None),
 ):
+    _get_current_user(request)  # require authentication
     """Parse a PDF using a user-defined custom format config with intelligent extraction."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
@@ -1437,7 +1520,8 @@ async def custom_convert(
         raise HTTPException(400, "No columns defined.")
 
     content = await file.read()
-    input_path = INPUT_DIR / file.filename
+    safe_name = _sanitize_filename(file.filename)
+    input_path = INPUT_DIR / safe_name
     input_path.write_bytes(content)
     tmp_path = str(input_path)
 
@@ -1697,16 +1781,18 @@ import traceback as _tb
 import math
 
 ALLOWED_IMPORTS = {
-    "re", "io", "os", "json", "csv", "math", "datetime", "collections",
+    "re", "io", "json", "csv", "math", "datetime", "collections",
     "pdfplumber", "pandas", "pd",
 }
 
 @app.post("/run-custom-code")
 async def run_custom_code(
+    request: Request,
     file: UploadFile = File(...),
     code: str = Form(...),
     password: Optional[str] = Form(None),
 ):
+    _get_current_user(request)  # require authentication
     """
     Execute user-provided Python parser code against an uploaded PDF.
     
@@ -1724,7 +1810,8 @@ async def run_custom_code(
 
     # Save file
     content = await file.read()
-    input_path = INPUT_DIR / file.filename
+    safe_name = _sanitize_filename(file.filename)
+    input_path = INPUT_DIR / safe_name
     input_path.write_bytes(content)
     tmp_path = str(input_path)
 
@@ -1749,7 +1836,7 @@ async def run_custom_code(
         # Pre-imported modules
         "re": re,
         "io": io,
-        "os": os,
+        # "os" removed — security risk (shell access)
         "json": json,
         "math": math,
         "pdfplumber": pdfplumber,
@@ -1813,12 +1900,15 @@ async def run_custom_code(
     except HTTPException:
         raise
     except Exception as e:
-        tb = _tb.format_exc()
-        # Return the full traceback so user can debug their code
+        import logging
+        logging.exception("run-custom-code error")
+        # Return only a sanitized error message, not the full traceback
+        error_msg = str(e)
+        if os.environ.get("DEBUG", "").lower() == "true":
+            error_msg += "\n\n" + _tb.format_exc()
         return JSONResponse({
             "ok": False,
-            "error": str(e),
-            "traceback": tb,
+            "error": f"Parsing failed: {error_msg}",
         }, status_code=422)
 
 
@@ -2083,10 +2173,12 @@ CUSTOM_FORMAT_DIR.mkdir(exist_ok=True)
 
 @app.post("/custom-format-request")
 async def custom_format_request(
+    request: Request,
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
     notes: Optional[str] = Form(None),
 ):
+    _require_admin(request)  # require admin role
     """Save a sample PDF for a custom format request."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
@@ -2110,7 +2202,48 @@ async def custom_format_request(
     meta_path = CUSTOM_FORMAT_DIR / f"{ts}_{safe_name}.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    return JSONResponse({"ok": True, "message": "Request saved", "file": dest.name})
+    return JSONResponse({"ok": True, "message": "Request saved", "file": dest.name, "request_id": f"{ts}_{safe_name}"})
+
+
+@app.get("/custom-format-requests")
+async def list_custom_format_requests(request: Request):
+    """List all custom format requests with their metadata and admin replies. Admin only."""
+    _require_admin(request)  # require admin role
+    requests_list = []
+    for meta_file in sorted(CUSTOM_FORMAT_DIR.glob("*.json"), reverse=True):
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            meta["request_id"] = meta_file.stem
+            # Redact sensitive fields
+            meta.pop("password", None)
+            requests_list.append(meta)
+        except Exception:
+            continue
+    return JSONResponse({"requests": requests_list})
+
+
+@app.put("/custom-format-requests/{request_id}/reply")
+async def reply_to_custom_format_request(
+    request: Request,
+    request_id: str,
+    status: str = Form(...),       # "available", "processing", "uploaded", "rejected", "too_large"
+    reply: str = Form(""),
+    matched_format: Optional[str] = Form(None),  # e.g. "kotak" if already available
+):
+    """Admin replies to a custom format request with a status update."""
+    _require_admin(request)  # require admin role
+    meta_path = CUSTOM_FORMAT_DIR / f"{request_id}.json"
+    if not meta_path.exists():
+        raise HTTPException(404, "Request not found")
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["status"] = status
+    meta["admin_reply"] = reply
+    meta["matched_format"] = matched_format or ""
+    meta["replied_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return JSONResponse({"ok": True, "message": "Reply saved"})
 
 
 @app.get("/health")
