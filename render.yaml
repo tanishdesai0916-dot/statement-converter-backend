@@ -2,8 +2,14 @@ services:
   - type: web
     name: statement-converter-backend
     runtime: python
-    buildCommand: "apt-get update && apt-get install -y ghostscript tesseract-ocr && pip install -r backend/requirements.txt"
-    startCommand: "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python backend.py   # change if needed
+
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11.6"
+        value: 3.10
+
+    aptPackages:
+      - ghostscript
+      - tesseract-ocr
