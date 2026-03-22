@@ -54,7 +54,7 @@ else:
     TESSERACT_EXE = shutil.which("tesseract") or "tesseract"
     GS_EXE        = shutil.which("gs") or "gs"
 
-OCR_DPI       = 400
+OCR_DPI       = 300
 MIN_ROWS      = 3
 
 INPUT_DIR  = Path(__file__).parent / "input"
