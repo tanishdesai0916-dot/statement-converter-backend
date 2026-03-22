@@ -64,7 +64,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ── Processing limits ─────────────────────────────────────────────────────────
 MAX_PDF_SIZE_MB = 50          # reject files larger than this
-CONVERT_TIMEOUT_SECS = 120   # timeout for /convert processing
+CONVERT_TIMEOUT_SECS = 300   # timeout for /convert processing (5 min for OCR)
 LARGE_PDF_PAGE_THRESHOLD = 10  # warn above this many pages
 
 app = FastAPI(title="StatementIQ API", version="1.0.0")
