@@ -84,11 +84,13 @@ from fastapi import Request
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 
 def _get_current_user(request: Request) -> dict:
-    """Validate Supabase JWT and return decoded claims. Raises HTTPException on failure."""
+    """Validate JWT and return user claims. Raises HTTPException on failure."""
     auth_header = request.headers.get("authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(401, "Missing or invalid Authorization header")
     token = auth_header.replace("Bearer ", "")
+
+    # 1) Try local JWT verification first (fast path)
     try:
         from jose import jwt as _jwt
         payload = _jwt.decode(
@@ -98,7 +100,47 @@ def _get_current_user(request: Request) -> dict:
         )
         return payload
     except Exception:
-        raise HTTPException(401, "Invalid or expired token")
+        pass
+
+    # 2) Fallback: verify token with Auth API (works even if signing key/algorithm changed)
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    verify_key = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if supabase_url and verify_key:
+        import json as _json
+        import urllib.error
+        import urllib.request
+
+        verify_url = f"{supabase_url}/auth/v1/user"
+        verify_req = urllib.request.Request(
+            verify_url,
+            headers={
+                "apikey": verify_key,
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(verify_req, timeout=8) as resp:
+                user = _json.loads(resp.read())
+                user_id = user.get("id")
+                if not user_id:
+                    raise HTTPException(401, "Invalid or expired token")
+                return {
+                    "sub": user_id,
+                    "email": user.get("email"),
+                    "aud": "authenticated",
+                }
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise HTTPException(401, "Invalid or expired token")
+            raise HTTPException(500, "Authentication service error")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(500, "Authentication service unavailable")
+
+    raise HTTPException(401, "Invalid or expired token")
 
 
 def _require_admin(request: Request) -> dict:
