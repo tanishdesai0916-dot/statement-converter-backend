@@ -598,7 +598,7 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
 
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
-        cmd = [GS_EXE, "-dSAFER", "-dBATCH", "-dNOPAUSE", f"-r{OCR_DPI}",
+        cmd = [gs_path, "-dSAFER", "-dBATCH", "-dNOPAUSE", f"-r{OCR_DPI}",
                "-sDEVICE=pnggray", f"-sOutputFile={out_pattern}",
                "-dNumRenderingThreads=1", "-dBufferSpace=100000"]
         if password:
