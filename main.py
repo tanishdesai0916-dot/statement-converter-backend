@@ -15,6 +15,7 @@ Install once:
 import io
 import base64
 import re
+import shutil
 import os
 import tempfile
 import subprocess
@@ -49,9 +50,9 @@ if platform.system() == "Windows":
     TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     GS_EXE        = r"C:\Program Files\gs\gs10.06.0\bin\gswin64c.exe"
 else:
-    # Linux / macOS (Render, Docker, etc.)
-    TESSERACT_EXE = "tesseract"
-    GS_EXE        = "gs"
+    # Linux / macOS (Render, Docker, etc.) – resolve via PATH
+    TESSERACT_EXE = shutil.which("tesseract") or "tesseract"
+    GS_EXE        = shutil.which("gs") or "gs"
 
 OCR_DPI       = 600
 MIN_ROWS      = 3
@@ -587,11 +588,13 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
     """Rasterise with Ghostscript then OCR each page with Tesseract."""
     if not OCR_AVAILABLE:
         raise RuntimeError("pytesseract / Pillow not installed")
-    if not os.path.exists(GS_EXE):
+    gs_path = shutil.which(GS_EXE) or GS_EXE
+    tess_path = shutil.which(TESSERACT_EXE) or TESSERACT_EXE
+    if not shutil.which(gs_path) and not os.path.exists(gs_path):
         raise RuntimeError(f"Ghostscript not found: {GS_EXE}")
-    if not os.path.exists(TESSERACT_EXE):
+    if not shutil.which(tess_path) and not os.path.exists(tess_path):
         raise RuntimeError(f"Tesseract not found: {TESSERACT_EXE}")
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+    pytesseract.pytesseract.tesseract_cmd = tess_path
 
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
@@ -810,7 +813,7 @@ def _hdfc_extract_text_hybrid(pdf_path: str, password: Optional[str] = None):
     # Only fall back to OCR if pdfplumber yields very little text
     if not text or len(text.strip()) < 100 or "Date" not in text:
         is_ocr = True
-        if OCR_AVAILABLE and os.path.exists(GS_EXE) and os.path.exists(TESSERACT_EXE):
+        if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)) and (shutil.which(TESSERACT_EXE) or os.path.exists(TESSERACT_EXE)):
             try:
                 pages_text = ocr_pdf(pdf_path, password)
                 total_pages = len(pages_text)
@@ -1369,7 +1372,7 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
             method = "cc_ocr"
             if not OCR_AVAILABLE:
                 raise HTTPException(500, "pytesseract / Pillow not installed on the server.")
-            if not os.path.exists(GS_EXE):
+            if not shutil.which(GS_EXE) and not os.path.exists(GS_EXE):
                 raise HTTPException(500, f"Ghostscript not found at: {GS_EXE}")
             pages_text = ocr_pdf(tmp_path, password)
             total_pages = len(pages_text)
@@ -2310,5 +2313,7 @@ async def reply_to_custom_format_request(
 @app.get("/health")
 def health():
     return {"status": "ok", "ocr_available": OCR_AVAILABLE,
-            "ghostscript": os.path.exists(GS_EXE),
-            "tesseract": os.path.exists(TESSERACT_EXE) if OCR_AVAILABLE else False}
+            "ghostscript": bool(shutil.which(GS_EXE) or os.path.exists(GS_EXE)),
+            "ghostscript_path": shutil.which(GS_EXE) or GS_EXE,
+            "tesseract": bool(shutil.which(TESSERACT_EXE) or os.path.exists(TESSERACT_EXE)) if OCR_AVAILABLE else False,
+            "tesseract_path": shutil.which(TESSERACT_EXE) or TESSERACT_EXE if OCR_AVAILABLE else None}
