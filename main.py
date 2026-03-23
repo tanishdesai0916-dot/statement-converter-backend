@@ -55,6 +55,9 @@ else:
     GS_EXE        = shutil.which("gs") or "gs"
 
 OCR_DPI       = 300
+OCR_DPI_LARGE_DOC = 220
+OCR_HIGH_PAGE_COUNT = 12
+GS_TIMEOUT_BASE_SECS = 120
 MIN_ROWS      = 3
 
 INPUT_DIR  = Path(__file__).parent / "input"
@@ -584,10 +587,18 @@ SUMMARY_LINE_RE = re.compile(
 )
 
 
+def _estimate_gs_timeout(page_count: int) -> int:
+    upper_bound = max(CONVERT_TIMEOUT_SECS - 20, GS_TIMEOUT_BASE_SECS)
+    if page_count <= 0:
+        return GS_TIMEOUT_BASE_SECS
+    return min(upper_bound, max(GS_TIMEOUT_BASE_SECS, page_count * 20))
+
+
 def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
     """Rasterise with Ghostscript then OCR each page with Tesseract."""
     if not OCR_AVAILABLE:
         raise RuntimeError("pytesseract / Pillow not installed")
+
     gs_path = shutil.which(GS_EXE) or GS_EXE
     tess_path = shutil.which(TESSERACT_EXE) or TESSERACT_EXE
     if not shutil.which(gs_path) and not os.path.exists(gs_path):
@@ -596,24 +607,69 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
         raise RuntimeError(f"Tesseract not found: {TESSERACT_EXE}")
     pytesseract.pytesseract.tesseract_cmd = tess_path
 
+    page_count = 0
+    try:
+        open_kwargs = {"path_or_fp": pdf_path}
+        if password:
+            open_kwargs["password"] = password
+        with pdfplumber.open(**open_kwargs) as pdf:
+            page_count = len(pdf.pages)
+    except Exception:
+        page_count = 0
+
+    dpi = OCR_DPI_LARGE_DOC if page_count >= OCR_HIGH_PAGE_COUNT else OCR_DPI
+    gs_timeout = _estimate_gs_timeout(page_count)
+
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
-        cmd = [gs_path, "-dSAFER", "-dBATCH", "-dNOPAUSE", f"-r{OCR_DPI}",
-               "-sDEVICE=pnggray", f"-sOutputFile={out_pattern}",
-               "-dNumRenderingThreads=1", "-dBufferSpace=100000"]
+        cmd = [
+            gs_path,
+            "-q",
+            "-dSAFER",
+            "-dBATCH",
+            "-dNOPAUSE",
+            f"-r{dpi}",
+            "-sDEVICE=pnggray",
+            f"-sOutputFile={out_pattern}",
+            "-dNumRenderingThreads=1",
+            "-dBufferSpace=100000",
+        ]
         if password:
             cmd.append(f"-sPDFPassword={password}")
         cmd.append(pdf_path)
-        subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=gs_timeout,
+        )
+
+        image_files = sorted(f for f in os.listdir(tmp) if f.endswith(".png"))
+        if not image_files:
+            raise RuntimeError("Ghostscript produced no rasterized pages for OCR")
 
         pages_text = []
-        for fn in sorted(f for f in os.listdir(tmp) if f.endswith(".png")):
-            img = Image.open(os.path.join(tmp, fn))
-            text = pytesseract.image_to_string(img, config="--oem 3 --psm 4") or ""
-            pages_text.append(text)
-            img.close()
-            del img
-            gc.collect()
+        for fn in image_files:
+            image_path = os.path.join(tmp, fn)
+            try:
+                with Image.open(image_path) as img:
+                    text = pytesseract.image_to_string(
+                        img,
+                        config="--oem 3 --psm 4",
+                        timeout=35,
+                    ) or ""
+                pages_text.append(text)
+            except RuntimeError:
+                # Tesseract timeout on a single page should not kill whole conversion
+                pages_text.append("")
+            finally:
+                try:
+                    os.remove(image_path)
+                except OSError:
+                    pass
+                gc.collect()
+
         return pages_text
 
 
@@ -1326,6 +1382,12 @@ async def convert(
     except Exception as e:
         gc.collect()
         raise HTTPException(500, f"Extraction failed: {repr(e)}")
+    finally:
+        try:
+            if input_path.exists():
+                input_path.unlink()
+        except Exception:
+            pass
 
 
 def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, password: Optional[str]):
@@ -1523,6 +1585,14 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
     except MemoryError:
         gc.collect()
         raise HTTPException(507, "Server ran out of memory processing this PDF. Try a smaller file.")
+    except subprocess.TimeoutExpired as e:
+        gc.collect()
+        timeout_secs = int(getattr(e, "timeout", 0) or 0)
+        raise HTTPException(
+            504,
+            f"OCR processing timed out after {timeout_secs} seconds. "
+            "Try a smaller PDF or split large files into parts.",
+        )
     except Exception as e:
         raise HTTPException(500, f"Extraction failed: {repr(e)}")
 
