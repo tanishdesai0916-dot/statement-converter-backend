@@ -54,8 +54,8 @@ else:
     TESSERACT_EXE = shutil.which("tesseract") or "tesseract"
     GS_EXE        = shutil.which("gs") or "gs"
 
-OCR_DPI       = 400
-OCR_DPI_LARGE_DOC = 300
+OCR_DPI       = 600
+OCR_DPI_LARGE_DOC = 400
 OCR_HIGH_PAGE_COUNT = 12
 GS_TIMEOUT_BASE_SECS = 120
 MIN_ROWS      = 3
