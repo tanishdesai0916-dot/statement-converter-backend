@@ -793,22 +793,47 @@ def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Option
 
     df_out = pd.DataFrame(columns=["Date", "Transaction Details", "Spends Area", "Debit", "Credit"])
     pages_processed = 0
+    pages_text_so_far: list[str] = []
+    emitted_rows = 0
 
     for page_num, page_total, page_text in ocr_pdf_iter(tmp_path, password):
         pages_processed = max(pages_processed, page_num)
         total_pages_hint = max(total_pages_hint, page_total, pages_processed)
 
-        page_df = format_cc_output(parse_cc_lines((page_text or "").splitlines()))
-        if not page_df.empty:
-            df_out = pd.concat([df_out, page_df], ignore_index=True)
+        # Re-parse accumulated OCR pages to preserve multiline/cross-page parsing accuracy,
+        # while still emitting incremental rows after each processed page.
+        pages_text_so_far.append(page_text or "")
+        blocks = extract_cc_blocks(pages_text_so_far)
+        all_cc = [parse_cc_lines(b) for b in blocks]
+        cc_combined = (
+            pd.concat([d for d in all_cc if not d.empty], ignore_index=True)
+            if any(not d.empty for d in all_cc)
+            else pd.DataFrame()
+        )
+        parsed_so_far = format_cc_output(cc_combined)
 
-        page_rows_json = _safe_rows_json(page_df) if not page_df.empty else []
+        replace_rows = False
+        rows_delta_df = pd.DataFrame(columns=["Date", "Transaction Details", "Spends Area", "Debit", "Credit"])
+
+        if len(parsed_so_far) < emitted_rows:
+            # In rare cases, a fuller context can re-shape previously detected rows.
+            # Ask the client to replace its live dataset with the latest snapshot.
+            replace_rows = True
+            rows_delta_df = parsed_so_far
+        elif len(parsed_so_far) > emitted_rows:
+            rows_delta_df = parsed_so_far.iloc[emitted_rows:].copy()
+
+        df_out = parsed_so_far
+        emitted_rows = int(len(df_out))
+        page_rows_json = _safe_rows_json(rows_delta_df) if not rows_delta_df.empty else []
+
         yield {
             "type": "page",
             "page": page_num,
             "totalPages": total_pages_hint,
             "rowsAdded": len(page_rows_json),
-            "rowsSoFar": int(len(df_out)),
+            "rowsSoFar": emitted_rows,
+            "replaceRows": replace_rows,
             "rows": page_rows_json,
         }
 
