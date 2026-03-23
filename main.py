@@ -24,14 +24,14 @@ import signal
 import gc
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Iterator
 import xml.etree.ElementTree as ET
 
 import pandas as pd
 import pdfplumber
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # ── Optional OCR imports ──────────────────────────────────────────────────────
@@ -655,8 +655,8 @@ def _ocr_pdf_batch(
         return pages_text
 
 
-def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
-    """OCR PDFs one page at a time and append each page's text incrementally."""
+def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tuple[int, int, str]]:
+    """Yield OCR text per page as (page_number, total_pages, page_text)."""
     if not OCR_AVAILABLE:
         raise RuntimeError("pytesseract / Pillow not installed")
 
@@ -683,12 +683,15 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
 
     # If page count is unavailable, keep legacy behavior as a fallback.
     if page_count <= 0:
-        return _ocr_pdf_batch(pdf_path, gs_path, dpi, gs_timeout, password)
+        batch_pages = _ocr_pdf_batch(pdf_path, gs_path, dpi, gs_timeout, password)
+        total_pages = len(batch_pages)
+        for idx, text in enumerate(batch_pages, 1):
+            yield idx, total_pages, text
+        return
 
     per_page_gs_timeout = max(30, min(gs_timeout, int(gs_timeout / page_count) + 25))
 
     with tempfile.TemporaryDirectory() as tmp:
-        pages_text: list[str] = []
         for page_num in range(1, page_count + 1):
             image_path = os.path.join(tmp, f"page_{page_num:04d}.png")
             cmd = [
@@ -710,6 +713,7 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
             cmd.append(pdf_path)
 
             try:
+                text = ""
                 subprocess.run(
                     cmd,
                     check=True,
@@ -724,10 +728,9 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
                         config="--oem 3 --psm 4",
                         timeout=35,
                     ) or ""
-                pages_text.append(text)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
                 # Continue to next pages even if one page fails OCR.
-                pages_text.append("")
+                text = ""
             finally:
                 try:
                     if os.path.exists(image_path):
@@ -736,7 +739,132 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
                     pass
                 gc.collect()
 
-        return pages_text
+            yield page_num, page_count, text
+
+
+def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
+    """OCR PDFs one page at a time and return all page texts."""
+    return [text for _, _, text in ocr_pdf_iter(pdf_path, password)]
+
+
+def _safe_rows_json(df: pd.DataFrame) -> list[dict]:
+    """Serialize dataframe rows safely for JSON (NaN/Inf -> None)."""
+    import math
+
+    rows_json = df.where(df.notna(), other=None).to_dict(orient="records")
+    for row in rows_json:
+        for k, v in row.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                row[k] = None
+    return rows_json
+
+
+def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Optional[str]):
+    """Yield NDJSON-compatible events while OCR/parsing Kotak CC page-by-page."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    method = "cc_ocr"
+    status = "UNKNOWN"
+    match_text = "Summary total not found (cannot compare)."
+    problems: list[dict] = []
+
+    if not OCR_AVAILABLE:
+        raise HTTPException(500, "pytesseract / Pillow not installed on the server.")
+    if not shutil.which(GS_EXE) and not os.path.exists(GS_EXE):
+        raise HTTPException(500, f"Ghostscript not found at: {GS_EXE}")
+    if not shutil.which(TESSERACT_EXE) and not os.path.exists(TESSERACT_EXE):
+        raise HTTPException(500, f"Tesseract not found at: {TESSERACT_EXE}")
+
+    total_pages_hint = 0
+    try:
+        open_kwargs = {"path_or_fp": tmp_path}
+        if password:
+            open_kwargs["password"] = password
+        with pdfplumber.open(**open_kwargs) as pdf:
+            total_pages_hint = len(pdf.pages)
+    except Exception:
+        total_pages_hint = 0
+
+    yield {
+        "type": "start",
+        "pdfName": filename,
+        "totalPages": total_pages_hint,
+        "mode": "cc",
+    }
+
+    df_out = pd.DataFrame(columns=["Date", "Transaction Details", "Spends Area", "Debit", "Credit"])
+    pages_processed = 0
+
+    for page_num, page_total, page_text in ocr_pdf_iter(tmp_path, password):
+        pages_processed = max(pages_processed, page_num)
+        total_pages_hint = max(total_pages_hint, page_total, pages_processed)
+
+        page_df = format_cc_output(parse_cc_lines((page_text or "").splitlines()))
+        if not page_df.empty:
+            df_out = pd.concat([df_out, page_df], ignore_index=True)
+
+        page_rows_json = _safe_rows_json(page_df) if not page_df.empty else []
+        yield {
+            "type": "page",
+            "page": page_num,
+            "totalPages": total_pages_hint,
+            "rowsAdded": len(page_rows_json),
+            "rowsSoFar": int(len(df_out)),
+            "rows": page_rows_json,
+        }
+
+    if df_out.empty or len(df_out) < MIN_ROWS:
+        raise HTTPException(
+            422,
+            f"Extraction produced fewer than {MIN_ROWS} rows. "
+            "Check that this is the right statement type.",
+        )
+
+    stem = Path(filename).stem
+    xlsx_bytes = df_to_excel_bytes(df_out)
+    xml_bytes = df_to_xml_bytes(df_out)
+
+    xlsx_name = f"{stem}_transactions.xlsx"
+    xml_name = f"{stem}_transactions.xml"
+
+    (OUTPUT_DIR / xlsx_name).write_bytes(xlsx_bytes)
+    (OUTPUT_DIR / xml_name).write_bytes(xml_bytes)
+
+    xlsx_b64 = b64(xlsx_bytes)
+    xml_b64 = b64(xml_bytes)
+    rows_json = _safe_rows_json(df_out)
+
+    detail_total = float(pd.to_numeric(df_out.get("Debit"), errors="coerce").fillna(0).sum()) if not df_out.empty else 0.0
+    summary_total = None
+
+    yield {
+        "type": "done",
+        "result": {
+            "ok": True,
+            "rows": rows_json,
+            "report": {
+                "pdfName": filename,
+                "runTime": now_str,
+                "pagesProcessed": total_pages_hint,
+                "rowsExtracted": len(rows_json),
+                "problemLines": problems,
+                "detailTotal": detail_total,
+                "summaryTotal": summary_total,
+                "status": status,
+                "matchText": match_text,
+                "method": method,
+                "outputFiles": {
+                    "excel": xlsx_name,
+                    "xml": xml_name,
+                    "report": f"{stem}_extraction_report.txt",
+                },
+                "mode": "cc",
+            },
+            "files": {
+                "xlsx": xlsx_b64,
+                "xml": xml_b64,
+            },
+        },
+    }
 
 
 def extract_pdf_pages_text(pdf_path: str, password: Optional[str] = None,
@@ -1394,6 +1522,80 @@ def add_axis_total_row(df: pd.DataFrame) -> pd.DataFrame:
 # ── /convert ENDPOINT ─────────────────────────────────────────────────────────
 # =============================================================================
 
+
+@app.post("/convert-stream")
+async def convert_stream(
+    request: Request,
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    sub_mode: str = Form(""),
+    password: Optional[str] = Form(None),
+):
+    """Stream page-by-page OCR updates for Kotak CC as newline-delimited JSON."""
+    _get_current_user(request)  # require authentication
+
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are accepted.")
+    if mode != "kotak" or sub_mode != "cc":
+        raise HTTPException(400, "Streaming is currently supported only for Kotak credit-card OCR mode.")
+
+    content = await file.read()
+    safe_name = _sanitize_filename(file.filename)
+    input_path = INPUT_DIR / safe_name
+    input_path.write_bytes(content)
+    tmp_path = str(input_path)
+
+    def _stream_events():
+        import json as _json
+
+        try:
+            for event in _convert_kotak_cc_stream_sync(tmp_path, file.filename, password):
+                yield _json.dumps(event, ensure_ascii=False) + "\n"
+        except HTTPException as e:
+            yield _json.dumps({
+                "type": "error",
+                "status": e.status_code,
+                "detail": str(e.detail),
+            }, ensure_ascii=False) + "\n"
+        except MemoryError:
+            gc.collect()
+            yield _json.dumps({
+                "type": "error",
+                "status": 507,
+                "detail": "Server ran out of memory processing this PDF. Try a smaller file or split the PDF.",
+            }, ensure_ascii=False) + "\n"
+        except subprocess.TimeoutExpired as e:
+            gc.collect()
+            timeout_secs = int(getattr(e, "timeout", 0) or 0)
+            yield _json.dumps({
+                "type": "error",
+                "status": 504,
+                "detail": f"OCR processing timed out after {timeout_secs} seconds. Try a smaller PDF.",
+            }, ensure_ascii=False) + "\n"
+        except Exception as e:
+            gc.collect()
+            yield _json.dumps({
+                "type": "error",
+                "status": 500,
+                "detail": f"Extraction failed: {repr(e)}",
+            }, ensure_ascii=False) + "\n"
+        finally:
+            try:
+                if input_path.exists():
+                    input_path.unlink()
+            except Exception:
+                pass
+            gc.collect()
+
+    return StreamingResponse(
+        _stream_events(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 @app.post("/convert")
 async def convert(
     request: Request,
@@ -1603,14 +1805,9 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         xml_b64    = b64(xml_bytes)
         rows_count = max(len(df_out) - (1 if mode in ("pms", "aif") else 0), 0)
 
-        # Serialize rows as JSON (NaN → None for JSON safety)
+        # Serialize rows as JSON (NaN/Inf -> None)
         import math
-        rows_json = df_out.where(df_out.notna(), other=None).to_dict(orient="records")
-        # Ensure no NaN/Inf float values survive (they break JSON serialisation)
-        for row in rows_json:
-            for k, v in row.items():
-                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                    row[k] = None
+        rows_json = _safe_rows_json(df_out)
 
         # Sanitise totals too
         if isinstance(detail_total, float) and (math.isnan(detail_total) or math.isinf(detail_total)):
