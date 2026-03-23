@@ -594,32 +594,14 @@ def _estimate_gs_timeout(page_count: int) -> int:
     return min(upper_bound, max(GS_TIMEOUT_BASE_SECS, page_count * 20))
 
 
-def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
-    """Rasterise with Ghostscript then OCR each page with Tesseract."""
-    if not OCR_AVAILABLE:
-        raise RuntimeError("pytesseract / Pillow not installed")
-
-    gs_path = shutil.which(GS_EXE) or GS_EXE
-    tess_path = shutil.which(TESSERACT_EXE) or TESSERACT_EXE
-    if not shutil.which(gs_path) and not os.path.exists(gs_path):
-        raise RuntimeError(f"Ghostscript not found: {GS_EXE}")
-    if not shutil.which(tess_path) and not os.path.exists(tess_path):
-        raise RuntimeError(f"Tesseract not found: {TESSERACT_EXE}")
-    pytesseract.pytesseract.tesseract_cmd = tess_path
-
-    page_count = 0
-    try:
-        open_kwargs = {"path_or_fp": pdf_path}
-        if password:
-            open_kwargs["password"] = password
-        with pdfplumber.open(**open_kwargs) as pdf:
-            page_count = len(pdf.pages)
-    except Exception:
-        page_count = 0
-
-    dpi = OCR_DPI_LARGE_DOC if page_count >= OCR_HIGH_PAGE_COUNT else OCR_DPI
-    gs_timeout = _estimate_gs_timeout(page_count)
-
+def _ocr_pdf_batch(
+    pdf_path: str,
+    gs_path: str,
+    dpi: int,
+    gs_timeout: int,
+    password: Optional[str] = None,
+) -> list[str]:
+    """Fallback OCR mode: rasterize all pages in one Ghostscript run."""
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
         cmd = [
@@ -637,6 +619,7 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
         if password:
             cmd.append(f"-sPDFPassword={password}")
         cmd.append(pdf_path)
+
         subprocess.run(
             cmd,
             check=True,
@@ -661,11 +644,94 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
                     ) or ""
                 pages_text.append(text)
             except RuntimeError:
-                # Tesseract timeout on a single page should not kill whole conversion
                 pages_text.append("")
             finally:
                 try:
                     os.remove(image_path)
+                except OSError:
+                    pass
+                gc.collect()
+
+        return pages_text
+
+
+def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
+    """OCR PDFs one page at a time and append each page's text incrementally."""
+    if not OCR_AVAILABLE:
+        raise RuntimeError("pytesseract / Pillow not installed")
+
+    gs_path = shutil.which(GS_EXE) or GS_EXE
+    tess_path = shutil.which(TESSERACT_EXE) or TESSERACT_EXE
+    if not shutil.which(gs_path) and not os.path.exists(gs_path):
+        raise RuntimeError(f"Ghostscript not found: {GS_EXE}")
+    if not shutil.which(tess_path) and not os.path.exists(tess_path):
+        raise RuntimeError(f"Tesseract not found: {TESSERACT_EXE}")
+    pytesseract.pytesseract.tesseract_cmd = tess_path
+
+    page_count = 0
+    try:
+        open_kwargs = {"path_or_fp": pdf_path}
+        if password:
+            open_kwargs["password"] = password
+        with pdfplumber.open(**open_kwargs) as pdf:
+            page_count = len(pdf.pages)
+    except Exception:
+        page_count = 0
+
+    dpi = OCR_DPI_LARGE_DOC if page_count >= OCR_HIGH_PAGE_COUNT else OCR_DPI
+    gs_timeout = _estimate_gs_timeout(page_count)
+
+    # If page count is unavailable, keep legacy behavior as a fallback.
+    if page_count <= 0:
+        return _ocr_pdf_batch(pdf_path, gs_path, dpi, gs_timeout, password)
+
+    per_page_gs_timeout = max(30, min(gs_timeout, int(gs_timeout / page_count) + 25))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pages_text: list[str] = []
+        for page_num in range(1, page_count + 1):
+            image_path = os.path.join(tmp, f"page_{page_num:04d}.png")
+            cmd = [
+                gs_path,
+                "-q",
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                f"-r{dpi}",
+                "-sDEVICE=pnggray",
+                f"-dFirstPage={page_num}",
+                f"-dLastPage={page_num}",
+                f"-sOutputFile={image_path}",
+                "-dNumRenderingThreads=1",
+                "-dBufferSpace=100000",
+            ]
+            if password:
+                cmd.append(f"-sPDFPassword={password}")
+            cmd.append(pdf_path)
+
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=per_page_gs_timeout,
+                )
+
+                with Image.open(image_path) as img:
+                    text = pytesseract.image_to_string(
+                        img,
+                        config="--oem 3 --psm 4",
+                        timeout=35,
+                    ) or ""
+                pages_text.append(text)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
+                # Continue to next pages even if one page fails OCR.
+                pages_text.append("")
+            finally:
+                try:
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
                 except OSError:
                     pass
                 gc.collect()
