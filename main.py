@@ -1496,6 +1496,46 @@ async def convert(
 
 def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, password: Optional[str]):
     """Synchronous conversion logic — runs in a thread pool."""
+    # ── Early check: is the PDF password-protected? ──────────────────────
+    try:
+        import pikepdf
+        try:
+            test_pdf = pikepdf.open(tmp_path, password=password or "")
+            test_pdf.close()
+        except pikepdf._core.PasswordError:
+            if not password:
+                raise HTTPException(
+                    400,
+                    "This PDF is password-protected. Please provide the password and try again."
+                )
+            else:
+                raise HTTPException(
+                    400,
+                    "The password you entered is incorrect. Please check and try again."
+                )
+    except HTTPException:
+        raise
+    except ImportError:
+        # pikepdf not available, fall back to pdfplumber check
+        try:
+            with pdfplumber.open(tmp_path) as _test:
+                pass
+        except Exception as e:
+            err_str = str(e).lower()
+            if "password" in err_str or "encrypt" in err_str:
+                if not password:
+                    raise HTTPException(
+                        400,
+                        "This PDF is password-protected. Please provide the password and try again."
+                    )
+                else:
+                    raise HTTPException(
+                        400,
+                        "The password you entered is incorrect. Please check and try again."
+                    )
+    except Exception:
+        pass  # Not a password issue, continue normally
+
     try:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         problems = []
