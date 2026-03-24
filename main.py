@@ -1153,8 +1153,8 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
             elif current_block:
                 current_block += " " + clean_line
 
-    # Flush last block (big statements without summary marker)
-    if current_block:
+    # Flush last block only if loop ended without hard stop
+    if current_block and (not all_blocks or all_blocks[-1] is not current_block):
         all_blocks.append(current_block)
 
     return all_blocks
