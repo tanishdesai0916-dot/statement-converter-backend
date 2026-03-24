@@ -59,6 +59,8 @@ OCR_DPI_LARGE_DOC = 600
 OCR_HIGH_PAGE_COUNT = 12
 GS_TIMEOUT_BASE_SECS = 120
 MIN_ROWS      = 1
+OCR_DATE_HINT_RE = re.compile(r"\b\d{1,2}[\-/\.\s]\d{1,2}[\-/\.\s]\d{2,4}\b")
+OCR_AMOUNT_HINT_RE = re.compile(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b")
 
 INPUT_DIR  = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -343,13 +345,13 @@ def _pms_summary_total(lines):
     return total if found else None
 
 
-def parse_pms_pdf(pdf_path: str, password: Optional[str] = None):
+def parse_pms_pdf(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
     rows, problems = [], []
     summary_lines = []
     summary_mode = False
 
     # Use OCR-fallback text extraction
-    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password)
+    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
     total_pages = len(pages_text)
 
     for page_idx, text in enumerate(pages_text, 1):
@@ -415,11 +417,12 @@ def add_pms_total_row(df: pd.DataFrame) -> pd.DataFrame:
 
 from dateutil import parser as dateparser
 
-BANK_DATE_LINE_RE = re.compile(r"^(\d{2} \w{3}, \d{4})\s+(.*)$")
+BANK_DATE_LINE_RE = re.compile(r"^(\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4})\s+(.*)$")
 BANK_MONEY_RE     = re.compile(r"[+-]?\d{1,3}(?:,\d{3})*(?:\.\d{2})")
 BANK_REF_RE       = re.compile(
     r"(UPI-\d{10,}|NEFTINW-\d+|IMPS-\d+|ONBF-[A-Za-z0-9]+|\b\d{9,}\b)", re.IGNORECASE
 )
+BANK_TABLE_HEADER_RE = re.compile(r"date\s+transaction\s+details", re.IGNORECASE)
 TABLE_END_RE      = re.compile(
     r"(most\s*important\s*terms|mitc|terms\s*and\s*conditions|schedule\s*of\s*charges"
     r"|grievance|ombudsman|disclaimer|customer\s*care|important\s*information"
@@ -493,12 +496,18 @@ def is_bad_bank_line(line: str) -> bool:
     return False
 
 
-def parse_kotak_bank(pdf_path: str, password: Optional[str] = None) -> pd.DataFrame:
+def _looks_like_kotak_txn_line(line: str) -> bool:
+    if not BANK_DATE_LINE_RE.match(line):
+        return False
+    return len(BANK_MONEY_RE.findall(line)) >= 2
+
+
+def parse_kotak_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False) -> pd.DataFrame:
     rows = []
     capture = False
 
     # Use OCR-fallback text extraction
-    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password)
+    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
     total_pages = len(pages_text)
 
     for txt in pages_text:
@@ -506,9 +515,13 @@ def parse_kotak_bank(pdf_path: str, password: Optional[str] = None) -> pd.DataFr
             line = clean(raw)
             if not line:
                 continue
-            if not capture and re.search(r"DATE\s+TRANSACTION\s+DETAILS", line, re.IGNORECASE):
+            if not capture and BANK_TABLE_HEADER_RE.search(line):
                 capture = True
                 continue
+
+            if not capture and _looks_like_kotak_txn_line(line):
+                capture = True
+
             if capture and (re.search(r"^SUMMARY\b", line, re.IGNORECASE) or TABLE_END_RE.search(line)):
                 capture = False
                 break
@@ -520,7 +533,7 @@ def parse_kotak_bank(pdf_path: str, password: Optional[str] = None) -> pd.DataFr
                     rows[-1]["Description"] = clean(rows[-1]["Description"] + " " + line)
                 continue
             dt_raw, rest = m.group(1), m.group(2)
-            txn_date = parse_any_date(dt_raw)
+            txn_date = parse_any_date(dt_raw.replace(",", ""))
             monies = BANK_MONEY_RE.findall(rest)
             if len(monies) < 2:
                 continue
@@ -594,6 +607,58 @@ def _estimate_gs_timeout(page_count: int) -> int:
     return min(upper_bound, max(GS_TIMEOUT_BASE_SECS, page_count * 20))
 
 
+def _normalize_ocr_text(text: str) -> str:
+    if not text:
+        return ""
+
+    normalized_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.replace("₹", " ").replace("|", " ").replace("¦", " ")
+        line = line.replace("—", "-").replace("–", "-")
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+
+        line = re.sub(r"(?<=\d)[oO](?=\d)", "0", line)
+        line = re.sub(r"(?<=\d)[lI](?=\d)", "1", line)
+        line = re.sub(r"(?<=\d)[sS](?=\d)", "5", line)
+        line = re.sub(r"(\d{1,2})[.\s](\d{1,2})[.\s](\d{2,4})(?=\b)", r"\1/\2/\3", line)
+        normalized_lines.append(line)
+
+    return "\n".join(normalized_lines)
+
+
+def _ocr_quality_score(text: str) -> int:
+    if not text:
+        return 0
+    compact = text.replace("\n", " ").strip()
+    char_count = len(compact)
+    date_hits = len(OCR_DATE_HINT_RE.findall(text))
+    amount_hits = len(OCR_AMOUNT_HINT_RE.findall(text))
+    return char_count + (date_hits * 60) + (amount_hits * 20)
+
+
+def _ocr_image_to_text(img: Image.Image) -> str:
+    primary_raw = pytesseract.image_to_string(
+        img,
+        config="--oem 3 --psm 4 -c preserve_interword_spaces=1",
+        timeout=35,
+    ) or ""
+    primary = _normalize_ocr_text(primary_raw)
+
+    if _ocr_quality_score(primary) >= 140 and OCR_DATE_HINT_RE.search(primary):
+        return primary
+
+    fallback_raw = pytesseract.image_to_string(
+        img,
+        config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
+        timeout=35,
+    ) or ""
+    fallback = _normalize_ocr_text(fallback_raw)
+
+    return fallback if _ocr_quality_score(fallback) > _ocr_quality_score(primary) else primary
+
+
 def _ocr_pdf_batch(
     pdf_path: str,
     gs_path: str,
@@ -637,11 +702,7 @@ def _ocr_pdf_batch(
             image_path = os.path.join(tmp, fn)
             try:
                 with Image.open(image_path) as img:
-                    text = pytesseract.image_to_string(
-                        img,
-                        config="--oem 3 --psm 4",
-                        timeout=35,
-                    ) or ""
+                    text = _ocr_image_to_text(img)
                 pages_text.append(text)
             except RuntimeError:
                 pages_text.append("")
@@ -723,11 +784,7 @@ def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tupl
                 )
 
                 with Image.open(image_path) as img:
-                    text = pytesseract.image_to_string(
-                        img,
-                        config="--oem 3 --psm 4",
-                        timeout=35,
-                    ) or ""
+                    text = _ocr_image_to_text(img)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
                 # Continue to next pages even if one page fails OCR.
                 text = ""
@@ -893,7 +950,8 @@ def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Option
 
 
 def extract_pdf_pages_text(pdf_path: str, password: Optional[str] = None,
-                           x_tolerance: int = 2, y_tolerance: int = 2) -> tuple[list[str], str]:
+                           x_tolerance: int = 2, y_tolerance: int = 2,
+                           force_ocr: bool = False) -> tuple[list[str], str]:
     """
     Extract text from each page of a PDF using pdfplumber.
     Falls back to OCR if pdfplumber yields very little usable text.
@@ -915,11 +973,19 @@ def extract_pdf_pages_text(pdf_path: str, password: Optional[str] = None,
     # Check if pdfplumber yielded enough text — if not, fall back to OCR
     total_chars = sum(len(t.strip()) for t in pages_text)
     has_date = any(re.search(r"\d{2}[\/\-]\d{2}[\/\-]\d{2,4}", t) for t in pages_text if t)
-    if total_chars < 100 or not has_date:
+    should_try_ocr = force_ocr or total_chars < 100 or not has_date
+    if should_try_ocr:
         if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)):
             try:
                 ocr_pages = ocr_pdf(pdf_path, password)
-                if ocr_pages and sum(len(t.strip()) for t in ocr_pages) > total_chars:
+                ocr_pages = [_normalize_ocr_text(t) for t in ocr_pages]
+                ocr_chars = sum(len(t.strip()) for t in ocr_pages)
+                ocr_has_date = any(re.search(r"\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}", t) for t in ocr_pages if t)
+
+                if force_ocr and ocr_pages:
+                    return ocr_pages, "ocr"
+
+                if ocr_pages and ocr_chars >= max(int(total_chars * 0.8), 60) and (ocr_has_date or not has_date):
                     return ocr_pages, "ocr"
             except Exception:
                 pass
@@ -1089,7 +1155,7 @@ def _hdfc_clean_amount(x):
     return float(x or 0.0)
 
 
-def _hdfc_extract_text_hybrid(pdf_path: str, password: Optional[str] = None):
+def _hdfc_extract_text_hybrid(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
     """Try pdfplumber first, fall back to OCR only if text is insufficient."""
     text = ""
     is_ocr = False
@@ -1106,18 +1172,18 @@ def _hdfc_extract_text_hybrid(pdf_path: str, password: Optional[str] = None):
     except Exception:
         pass
 
-    # Only fall back to OCR if pdfplumber yields very little text
-    if not text or len(text.strip()) < 100 or "Date" not in text:
+    # Only fall back to OCR if pdfplumber yields very little text (or when forced)
+    if force_ocr or not text or len(text.strip()) < 100 or "Date" not in text:
         is_ocr = True
         if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)) and (shutil.which(TESSERACT_EXE) or os.path.exists(TESSERACT_EXE)):
             try:
                 pages_text = ocr_pdf(pdf_path, password)
                 total_pages = len(pages_text)
-                text = "\n".join(pages_text)
+                text = "\n".join(_normalize_ocr_text(p) for p in pages_text)
             except Exception:
                 pass
 
-    method = "hdfc_ocr" if is_ocr else "hdfc_text"
+    method = "ocr" if is_ocr else "text"
     return text, is_ocr, total_pages, method
 
 
@@ -1226,8 +1292,8 @@ def _hdfc_parse_row(block_text: str, prev_balance, is_ocr: bool):
     }, closing_bal
 
 
-def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None):
-    full_text, is_ocr, total_pages, method = _hdfc_extract_text_hybrid(pdf_path, password)
+def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
+    full_text, is_ocr, total_pages, method = _hdfc_extract_text_hybrid(pdf_path, password, force_ocr=force_ocr)
 
     # Extract opening balance
     open_bal_match = re.search(r"Opening\s+Balance\s+([\d,]+\.\d{2})", full_text, re.IGNORECASE)
@@ -1469,8 +1535,8 @@ def _icici_parse_to_dataframe(raw_rows, initial_bal):
     return pd.DataFrame(data)
 
 
-def parse_icici_bank(pdf_path: str, password: Optional[str] = None):
-    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password)
+def parse_icici_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
+    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
     total_pages = len(pages_text)
     full_text = "\n".join(pages_text)
 
@@ -1510,12 +1576,12 @@ AXIS_TXN_PATTERN = re.compile(
 )
 
 
-def parse_axis_cc(pdf_path: str, password: Optional[str] = None):
+def parse_axis_cc(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
     rows = []
     problem_lines = []
 
     # Use OCR-fallback text extraction
-    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password)
+    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
     total_pages = len(pages_text)
 
     for page_idx, text in enumerate(pages_text, 1):
@@ -1715,6 +1781,20 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         # ── PMS ──────────────────────────────────────────────────────────────
         if mode == "pms":
             df, problems, total_pages, summary_total, ext_method = parse_pms_pdf(tmp_path, password)
+            if ext_method == "text" and len(df) < MIN_ROWS:
+                df_retry, problems_retry, pages_retry, summary_retry, method_retry = parse_pms_pdf(
+                    tmp_path,
+                    password,
+                    force_ocr=True,
+                )
+                if len(df_retry) > len(df):
+                    df, problems, total_pages, summary_total, ext_method = (
+                        df_retry,
+                        problems_retry,
+                        pages_retry,
+                        summary_retry,
+                        method_retry,
+                    )
             df_with_total = add_pms_total_row(df)
             detail_total  = float(
                 pd.to_numeric(df.get("Settlement Amount", pd.Series(dtype=float)), errors="coerce")
@@ -1735,6 +1815,10 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         # ── KOTAK BANK ───────────────────────────────────────────────────────
         elif mode == "kotak" and sub_mode == "bank":
             df_bank, total_pages, ext_method = parse_kotak_bank(tmp_path, password)
+            if ext_method == "text" and len(df_bank) < MIN_ROWS:
+                df_retry, pages_retry, method_retry = parse_kotak_bank(tmp_path, password, force_ocr=True)
+                if len(df_retry) > len(df_bank):
+                    df_bank, total_pages, ext_method = df_retry, pages_retry, method_retry
             df_out  = df_bank
             method  = f"bank_{ext_method}"
             detail_total = float(
@@ -1763,6 +1847,23 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         # ── AIF ───────────────────────────────────────────────────────────
         elif mode == "aif":
             df_out, problems, total_pages, detail_total, summary_total, ext_method = parse_aif_pdf(tmp_path, password)
+            base_rows = max(len(df_out) - 1, 0)
+            if ext_method == "text" and base_rows < MIN_ROWS:
+                df_retry, problems_retry, pages_retry, detail_retry, summary_retry, method_retry = parse_aif_pdf(
+                    tmp_path,
+                    password,
+                    force_ocr=True,
+                )
+                retry_base_rows = max(len(df_retry) - 1, 0)
+                if retry_base_rows > base_rows:
+                    df_out, problems, total_pages, detail_total, summary_total, ext_method = (
+                        df_retry,
+                        problems_retry,
+                        pages_retry,
+                        detail_retry,
+                        summary_retry,
+                        method_retry,
+                    )
             method = f"aif_{ext_method}"
 
             if summary_total is not None:
@@ -1777,6 +1878,14 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         # ── AXIS CREDIT CARD ─────────────────────────────────────────────────
         elif mode == "axis":
             df_axis, problems, total_pages, ext_method = parse_axis_cc(tmp_path, password)
+            if ext_method == "text" and len(df_axis) < MIN_ROWS:
+                df_retry, problems_retry, pages_retry, method_retry = parse_axis_cc(
+                    tmp_path,
+                    password,
+                    force_ocr=True,
+                )
+                if len(df_retry) > len(df_axis):
+                    df_axis, problems, total_pages, ext_method = df_retry, problems_retry, pages_retry, method_retry
             df_out = add_axis_total_row(df_axis)
             detail_total = pd.to_numeric(df_axis["Amount"], errors="coerce").fillna(0).sum() if not df_axis.empty else 0
             method = f"axis_{ext_method}"
@@ -1786,6 +1895,20 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         # ── HDFC BANK ─────────────────────────────────────────────────────
         elif mode == "hdfc":
             df_hdfc, problems, total_pages, hdfc_meta, ext_method = parse_hdfc_bank(tmp_path, password)
+            if ext_method == "text" and len(df_hdfc) < MIN_ROWS:
+                df_retry, problems_retry, pages_retry, meta_retry, method_retry = parse_hdfc_bank(
+                    tmp_path,
+                    password,
+                    force_ocr=True,
+                )
+                if len(df_retry) > len(df_hdfc):
+                    df_hdfc, problems, total_pages, hdfc_meta, ext_method = (
+                        df_retry,
+                        problems_retry,
+                        pages_retry,
+                        meta_retry,
+                        method_retry,
+                    )
             df_out = add_hdfc_total_row(df_hdfc)
             detail_total = pd.to_numeric(df_hdfc["WithdrawalAmt"], errors="coerce").fillna(0).sum() if not df_hdfc.empty else 0
             method = f"hdfc_{ext_method}"
@@ -1813,6 +1936,14 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
         # ── ICICI BANK ────────────────────────────────────────────────────
         elif mode == "icici":
             df_icici, problems, total_pages, ext_method = parse_icici_bank(tmp_path, password)
+            if ext_method == "text" and len(df_icici) < MIN_ROWS:
+                df_retry, problems_retry, pages_retry, method_retry = parse_icici_bank(
+                    tmp_path,
+                    password,
+                    force_ocr=True,
+                )
+                if len(df_retry) > len(df_icici):
+                    df_icici, problems, total_pages, ext_method = df_retry, problems_retry, pages_retry, method_retry
             df_out = add_icici_total_row(df_icici)
             detail_total = pd.to_numeric(df_icici["WITHDRAWALS"], errors="coerce").fillna(0).sum() if not df_icici.empty else 0
             method = f"icici_{ext_method}"
@@ -2588,10 +2719,10 @@ def _aif_add_total_row(df):
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True), total
 
 
-def parse_aif_pdf(pdf_path: str, password: Optional[str] = None):
+def parse_aif_pdf(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
     """Parse AIF statement PDF and return (df_with_total, problems, total_pages, detail_total, summary_total, extraction_method)."""
     # Use OCR-fallback text extraction
-    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password)
+    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
     total_pages = len(pages_text)
 
     lines = []
