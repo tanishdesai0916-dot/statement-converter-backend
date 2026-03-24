@@ -24,7 +24,7 @@ import signal
 import gc
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Iterator
+from typing import Optional
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -708,8 +708,8 @@ def _ocr_pdf_batch(
         return pages_text
 
 
-def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tuple[int, int, str]]:
-    """Yield OCR text per page as (page_number, total_pages, page_text)."""
+def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
+    """OCR all pages of a PDF in a single Ghostscript batch run."""
     if not OCR_AVAILABLE:
         raise RuntimeError("pytesseract / Pillow not installed")
 
@@ -734,62 +734,7 @@ def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tupl
     dpi = OCR_DPI_LARGE_DOC if page_count >= OCR_HIGH_PAGE_COUNT else OCR_DPI
     gs_timeout = _estimate_gs_timeout(page_count)
 
-    # If page count is unavailable, keep legacy behavior as a fallback.
-    if page_count <= 0:
-        batch_pages = _ocr_pdf_batch(pdf_path, gs_path, dpi, gs_timeout, password)
-        total_pages = len(batch_pages)
-        for idx, text in enumerate(batch_pages, 1):
-            yield idx, total_pages, text
-        return
-
-    per_page_gs_timeout = max(30, min(gs_timeout, int(gs_timeout / page_count) + 25))
-
-    with tempfile.TemporaryDirectory() as tmp:
-        for page_num in range(1, page_count + 1):
-            image_path = os.path.join(tmp, f"page_{page_num:04d}.png")
-            cmd = [
-                gs_path,
-                "-q",
-                "-dSAFER",
-                "-dBATCH",
-                "-dNOPAUSE",
-                f"-r{dpi}",
-                "-sDEVICE=png16m",
-                f"-dFirstPage={page_num}",
-                f"-dLastPage={page_num}",
-                f"-sOutputFile={image_path}",
-            ]
-            if password:
-                cmd.append(f"-sPDFPassword={password}")
-            cmd.append(pdf_path)
-
-            try:
-                text = ""
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=per_page_gs_timeout,
-                )
-
-                with Image.open(image_path) as img:
-                    text = _ocr_image_to_text(img)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
-                text = ""
-            finally:
-                try:
-                    if os.path.exists(image_path):
-                        os.remove(image_path)
-                except OSError:
-                    pass
-
-            yield page_num, page_count, text
-
-
-def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
-    """OCR PDFs one page at a time and return all page texts."""
-    return [text for _, _, text in ocr_pdf_iter(pdf_path, password)]
+    return _ocr_pdf_batch(pdf_path, gs_path, dpi, gs_timeout, password)
 
 
 def _safe_rows_json(df: pd.DataFrame) -> list[dict]:
@@ -805,7 +750,7 @@ def _safe_rows_json(df: pd.DataFrame) -> list[dict]:
 
 
 def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Optional[str]):
-    """Yield NDJSON-compatible events while OCR/parsing Kotak CC page-by-page."""
+    """Yield NDJSON-compatible events while OCR/parsing Kotak CC."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     method = "cc_ocr"
     status = "UNKNOWN"
@@ -836,51 +781,18 @@ def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Option
         "mode": "cc",
     }
 
-    df_out = pd.DataFrame(columns=["Date", "Transaction Details", "Spends Area", "Debit", "Credit"])
-    pages_processed = 0
-    pages_text_so_far: list[str] = []
-    emitted_rows = 0
+    # OCR all pages in one batch
+    pages_text = ocr_pdf(tmp_path, password)
+    total_pages_hint = max(total_pages_hint, len(pages_text))
 
-    for page_num, page_total, page_text in ocr_pdf_iter(tmp_path, password):
-        pages_processed = max(pages_processed, page_num)
-        total_pages_hint = max(total_pages_hint, page_total, pages_processed)
-
-        # Re-parse accumulated OCR pages to preserve multiline/cross-page parsing accuracy,
-        # while still emitting incremental rows after each processed page.
-        pages_text_so_far.append(page_text or "")
-        blocks = extract_cc_blocks(pages_text_so_far)
-        all_cc = [parse_cc_lines(b) for b in blocks]
-        cc_combined = (
-            pd.concat([d for d in all_cc if not d.empty], ignore_index=True)
-            if any(not d.empty for d in all_cc)
-            else pd.DataFrame()
-        )
-        parsed_so_far = format_cc_output(cc_combined)
-
-        replace_rows = False
-        rows_delta_df = pd.DataFrame(columns=["Date", "Transaction Details", "Spends Area", "Debit", "Credit"])
-
-        if len(parsed_so_far) < emitted_rows:
-            # In rare cases, a fuller context can re-shape previously detected rows.
-            # Ask the client to replace its live dataset with the latest snapshot.
-            replace_rows = True
-            rows_delta_df = parsed_so_far
-        elif len(parsed_so_far) > emitted_rows:
-            rows_delta_df = parsed_so_far.iloc[emitted_rows:].copy()
-
-        df_out = parsed_so_far
-        emitted_rows = int(len(df_out))
-        page_rows_json = _safe_rows_json(rows_delta_df) if not rows_delta_df.empty else []
-
-        yield {
-            "type": "page",
-            "page": page_num,
-            "totalPages": total_pages_hint,
-            "rowsAdded": len(page_rows_json),
-            "rowsSoFar": emitted_rows,
-            "replaceRows": replace_rows,
-            "rows": page_rows_json,
-        }
+    blocks = extract_cc_blocks(pages_text)
+    all_cc = [parse_cc_lines(b) for b in blocks]
+    cc_combined = (
+        pd.concat([d for d in all_cc if not d.empty], ignore_index=True)
+        if any(not d.empty for d in all_cc)
+        else pd.DataFrame()
+    )
+    df_out = format_cc_output(cc_combined)
 
     if df_out.empty or len(df_out) < MIN_ROWS:
         raise HTTPException(
@@ -888,6 +800,18 @@ def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Option
             f"Extraction produced fewer than {MIN_ROWS} rows. "
             "Check that this is the right statement type.",
         )
+
+    # Emit a single page event with all rows
+    rows_json = _safe_rows_json(df_out)
+    yield {
+        "type": "page",
+        "page": total_pages_hint,
+        "totalPages": total_pages_hint,
+        "rowsAdded": len(rows_json),
+        "rowsSoFar": len(rows_json),
+        "replaceRows": False,
+        "rows": rows_json,
+    }
 
     stem = Path(filename).stem
     xlsx_bytes = df_to_excel_bytes(df_out)
@@ -901,7 +825,6 @@ def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Option
 
     xlsx_b64 = b64(xlsx_bytes)
     xml_b64 = b64(xml_bytes)
-    rows_json = _safe_rows_json(df_out)
 
     detail_total = float(pd.to_numeric(df_out.get("Debit"), errors="coerce").fillna(0).sum()) if not df_out.empty else 0.0
     summary_total = None
