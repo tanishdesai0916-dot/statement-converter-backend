@@ -58,7 +58,7 @@ OCR_DPI       = 600
 OCR_DPI_LARGE_DOC = 600
 OCR_HIGH_PAGE_COUNT = 12
 GS_TIMEOUT_BASE_SECS = 120
-MIN_ROWS      = 3
+MIN_ROWS      = 1
 
 INPUT_DIR  = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -896,17 +896,33 @@ def extract_pdf_pages_text(pdf_path: str, password: Optional[str] = None,
                            x_tolerance: int = 2, y_tolerance: int = 2) -> tuple[list[str], str]:
     """
     Extract text from each page of a PDF using pdfplumber.
-    Returns (list_of_page_texts, method) where method is 'text'.
+    Falls back to OCR if pdfplumber yields very little usable text.
+    Returns (list_of_page_texts, method) where method is 'text' or 'ocr'.
     """
     open_kwargs = {"path_or_fp": pdf_path}
     if password:
         open_kwargs["password"] = password
 
     pages_text = []
-    with pdfplumber.open(**open_kwargs) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(x_tolerance=x_tolerance, y_tolerance=y_tolerance) or ""
-            pages_text.append(text)
+    try:
+        with pdfplumber.open(**open_kwargs) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text(x_tolerance=x_tolerance, y_tolerance=y_tolerance) or ""
+                pages_text.append(text)
+    except Exception:
+        pages_text = []
+
+    # Check if pdfplumber yielded enough text — if not, fall back to OCR
+    total_chars = sum(len(t.strip()) for t in pages_text)
+    has_date = any(re.search(r"\d{2}[\/\-]\d{2}[\/\-]\d{2,4}", t) for t in pages_text if t)
+    if total_chars < 100 or not has_date:
+        if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)):
+            try:
+                ocr_pages = ocr_pdf(pdf_path, password)
+                if ocr_pages and sum(len(t.strip()) for t in ocr_pages) > total_chars:
+                    return ocr_pages, "ocr"
+            except Exception:
+                pass
 
     return pages_text, "text"
 
