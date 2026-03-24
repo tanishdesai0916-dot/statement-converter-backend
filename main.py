@@ -1196,7 +1196,7 @@ def _split_pdf_into_chunks(pdf_path: str, chunk_size: int, password: Optional[st
 
 
 def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
-    # Count total pages first
+    # Count total pages first - try multiple methods
     total_pages = 0
     try:
         open_kwargs = {"path_or_fp": pdf_path}
@@ -1207,9 +1207,23 @@ def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bo
     except Exception:
         pass
 
-    # For big PDFs, split into chunks, parse each, merge results
+    # Fallback: use pikepdf to count pages (works for scanned/OCR PDFs too)
+    if total_pages == 0 and PIKEPDF_AVAILABLE:
+        try:
+            open_kwargs_pike = {"filename_or_stream": pdf_path}
+            if password:
+                open_kwargs_pike["password"] = password
+            with pikepdf.open(**open_kwargs_pike) as pike_pdf:
+                total_pages = len(pike_pdf.pages)
+        except Exception:
+            pass
+
+    print(f"[HDFC] Total pages detected: {total_pages}, chunk_size: {HDFC_CHUNK_SIZE}, pikepdf available: {PIKEPDF_AVAILABLE}")
+
+    # For PDFs with more than HDFC_CHUNK_SIZE pages, split into chunks
     if total_pages > HDFC_CHUNK_SIZE and PIKEPDF_AVAILABLE:
         chunk_paths = _split_pdf_into_chunks(pdf_path, HDFC_CHUNK_SIZE, password)
+        print(f"[HDFC] Split into {len(chunk_paths)} chunks")
     else:
         chunk_paths = [pdf_path]
 
