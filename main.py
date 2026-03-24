@@ -669,17 +669,15 @@ def _ocr_pdf_batch(
     """Fallback OCR mode: rasterize all pages in one Ghostscript run."""
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
-        cmd = [
+    cmd = [
             gs_path,
             "-q",
             "-dSAFER",
             "-dBATCH",
             "-dNOPAUSE",
             f"-r{dpi}",
-            "-sDEVICE=pnggray",
+            "-sDEVICE=png16m",
             f"-sOutputFile={out_pattern}",
-            "-dNumRenderingThreads=1",
-            "-dBufferSpace=100000",
         ]
         if password:
             cmd.append(f"-sPDFPassword={password}")
@@ -706,12 +704,6 @@ def _ocr_pdf_batch(
                 pages_text.append(text)
             except RuntimeError:
                 pages_text.append("")
-            finally:
-                try:
-                    os.remove(image_path)
-                except OSError:
-                    pass
-                gc.collect()
 
         return pages_text
 
@@ -762,12 +754,10 @@ def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tupl
                 "-dBATCH",
                 "-dNOPAUSE",
                 f"-r{dpi}",
-                "-sDEVICE=pnggray",
+                "-sDEVICE=png16m",
                 f"-dFirstPage={page_num}",
                 f"-dLastPage={page_num}",
                 f"-sOutputFile={image_path}",
-                "-dNumRenderingThreads=1",
-                "-dBufferSpace=100000",
             ]
             if password:
                 cmd.append(f"-sPDFPassword={password}")
@@ -786,7 +776,6 @@ def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tupl
                 with Image.open(image_path) as img:
                     text = _ocr_image_to_text(img)
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
-                # Continue to next pages even if one page fails OCR.
                 text = ""
             finally:
                 try:
@@ -794,7 +783,6 @@ def ocr_pdf_iter(pdf_path: str, password: Optional[str] = None) -> Iterator[tupl
                         os.remove(image_path)
                 except OSError:
                     pass
-                gc.collect()
 
             yield page_num, page_count, text
 
