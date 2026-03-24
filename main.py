@@ -57,7 +57,7 @@ else:
 OCR_DPI       = 600
 OCR_DPI_LARGE_DOC = 600
 OCR_HIGH_PAGE_COUNT = 12
-GS_TIMEOUT_BASE_SECS = 120
+GS_TIMEOUT_BASE_SECS = 180
 MIN_ROWS      = 1
 OCR_DATE_HINT_RE = re.compile(r"\b\d{1,2}[\-/\.\s]\d{1,2}[\-/\.\s]\d{2,4}\b")
 OCR_AMOUNT_HINT_RE = re.compile(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b")
@@ -68,9 +68,9 @@ INPUT_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ── Processing limits ─────────────────────────────────────────────────────────
-MAX_PDF_SIZE_MB = 50          # reject files larger than this
-CONVERT_TIMEOUT_SECS = 300   # timeout for /convert processing (5 min for OCR)
-LARGE_PDF_PAGE_THRESHOLD = 10  # warn above this many pages
+MAX_PDF_SIZE_MB = 100         # reject files larger than this
+CONVERT_TIMEOUT_SECS = 540   # timeout for /convert processing (9 min — upgraded Render plan)
+LARGE_PDF_PAGE_THRESHOLD = 15  # warn above this many pages
 
 app = FastAPI(title="StatementIQ API", version="1.0.0")
 
