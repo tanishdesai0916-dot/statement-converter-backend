@@ -1125,19 +1125,13 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
                 start_recording = True
                 continue
 
-        # 2. Dual Block Hard Stop Logic
-        if is_ocr:
-            if HDFC_SUMMARY_START_OCR in clean_line:
-                if current_block:
-                    all_blocks.append(current_block)
-                print("[HDFC] OCR hard stop reached at Statement Summary.")
-                break
-        else:
-            if HDFC_SUMMARY_START in clean_line:
-                if current_block:
-                    all_blocks.append(current_block)
-                print("[HDFC] Digital hard stop reached at Statement Summary.")
-                break
+        # 2. Dual Block Hard Stop Logic — check both variants always
+        normalized = clean_line.replace(" ", "").upper()
+        if "STATEMENTSUMMARY" in normalized or HDFC_SUMMARY_START_OCR in clean_line or HDFC_SUMMARY_START in clean_line:
+            if current_block:
+                all_blocks.append(current_block)
+            print(f"[HDFC] Hard stop reached at Statement Summary. is_ocr={is_ocr}, line='{clean_line[:60]}'")
+            break
 
         # 3. Footer Skip Logic
         if HDFC_FOOTER_START in clean_line.replace(" ", ""):
