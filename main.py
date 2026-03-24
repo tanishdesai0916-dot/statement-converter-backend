@@ -42,6 +42,12 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+# ── PDF splitting for large files ─────────────────────────────────────────────
+try:
+    import pikepdf
+    PIKEPDF_AVAILABLE = True
+except ImportError:
+    PIKEPDF_AVAILABLE = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 import platform
@@ -708,8 +714,40 @@ def _ocr_pdf_batch(
         return pages_text
 
 
+PDF_OCR_CHUNK_SIZE = 10  # pages per chunk for OCR splitting
+
+
+def _split_pdf_for_ocr(pdf_path: str, chunk_size: int, password: Optional[str] = None) -> list[str]:
+    """Split a large PDF into temp chunk files for OCR. Returns list of paths (cleaned up by caller)."""
+    if not PIKEPDF_AVAILABLE:
+        return [pdf_path]
+    try:
+        open_kw = {"password": password} if password else {}
+        src = pikepdf.open(pdf_path, **open_kw)
+    except Exception:
+        return [pdf_path]
+
+    total = len(src.pages)
+    if total <= chunk_size:
+        src.close()
+        return [pdf_path]
+
+    chunk_paths = []
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk_pdf = pikepdf.Pdf.new()
+        for i in range(start, end):
+            chunk_pdf.pages.append(src.pages[i])
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        chunk_pdf.save(tmp.name)
+        chunk_pdf.close()
+        chunk_paths.append(tmp.name)
+    src.close()
+    return chunk_paths
+
+
 def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
-    """OCR all pages of a PDF in a single Ghostscript batch run."""
+    """OCR all pages of a PDF, splitting into chunks for large files."""
     if not OCR_AVAILABLE:
         raise RuntimeError("pytesseract / Pillow not installed")
 
@@ -732,9 +770,32 @@ def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
         page_count = 0
 
     dpi = OCR_DPI_LARGE_DOC if page_count >= OCR_HIGH_PAGE_COUNT else OCR_DPI
-    gs_timeout = _estimate_gs_timeout(page_count)
 
-    return _ocr_pdf_batch(pdf_path, gs_path, dpi, gs_timeout, password)
+    # Split large PDFs into chunks for reliable OCR
+    chunk_paths = _split_pdf_for_ocr(pdf_path, PDF_OCR_CHUNK_SIZE, password)
+    all_pages_text = []
+
+    for chunk_path in chunk_paths:
+        try:
+            chunk_page_count = 0
+            try:
+                with pdfplumber.open(chunk_path) as cpdf:
+                    chunk_page_count = len(cpdf.pages)
+            except Exception:
+                chunk_page_count = PDF_OCR_CHUNK_SIZE
+            gs_timeout = _estimate_gs_timeout(chunk_page_count)
+            # Don't pass password for split chunks (already decrypted by pikepdf)
+            chunk_pw = password if chunk_path == pdf_path else None
+            pages = _ocr_pdf_batch(chunk_path, gs_path, dpi, gs_timeout, chunk_pw)
+            all_pages_text.extend(pages)
+        finally:
+            if chunk_path != pdf_path:
+                try:
+                    os.unlink(chunk_path)
+                except Exception:
+                    pass
+
+    return all_pages_text
 
 
 def _safe_rows_json(df: pd.DataFrame) -> list[dict]:
@@ -1001,14 +1062,14 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
         if not clean_line:
             continue
 
-        # 1. Recording start logic
-        if is_ocr and not start_recording:
-            if HDFC_DATE_START_RE.match(clean_line):
-                start_recording = True
-        elif not is_ocr:
+        # 1. Recording start logic — for digital, skip repeated header lines
+        if not is_ocr:
             if HDFC_HEADER_TEXT.replace(" ", "") in clean_line.replace(" ", ""):
                 start_recording = True
                 continue
+        elif not start_recording:
+            if HDFC_DATE_START_RE.match(clean_line):
+                start_recording = True
 
         # 2. Dual hard-stop logic
         if is_ocr:
@@ -1041,6 +1102,10 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
                 current_block = clean_line
             elif current_block:
                 current_block += " " + clean_line
+
+    # Flush last block if loop ended without hitting summary marker (big statements)
+    if current_block:
+        all_blocks.append(current_block)
 
     return all_blocks
 
@@ -1094,35 +1159,115 @@ def _hdfc_parse_row(block_text: str, prev_balance, is_ocr: bool):
     }, closing_bal
 
 
+HDFC_CHUNK_SIZE = 10  # pages per chunk for big PDFs
+
+
+def _split_pdf_into_chunks(pdf_path: str, chunk_size: int, password: Optional[str] = None) -> list:
+    """Split a PDF into smaller temp files of chunk_size pages each. Returns list of temp file paths."""
+    if not PIKEPDF_AVAILABLE:
+        return [pdf_path]
+
+    try:
+        open_kwargs = {}
+        if password:
+            open_kwargs["password"] = password
+        src = pikepdf.open(pdf_path, **open_kwargs)
+    except Exception:
+        return [pdf_path]
+
+    total = len(src.pages)
+    if total <= chunk_size:
+        src.close()
+        return [pdf_path]
+
+    chunk_paths = []
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk_pdf = pikepdf.Pdf.new()
+        for i in range(start, end):
+            chunk_pdf.pages.append(src.pages[i])
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        chunk_pdf.save(tmp.name)
+        chunk_pdf.close()
+        chunk_paths.append(tmp.name)
+
+    src.close()
+    return chunk_paths
+
+
 def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
-    full_text, is_ocr, total_pages, method = _hdfc_extract_text_hybrid(pdf_path, password, force_ocr=force_ocr)
+    # Count total pages first
+    total_pages = 0
+    try:
+        open_kwargs = {"path_or_fp": pdf_path}
+        if password:
+            open_kwargs["password"] = password
+        with pdfplumber.open(**open_kwargs) as pdf:
+            total_pages = len(pdf.pages)
+    except Exception:
+        pass
 
-    # Extract opening balance
-    open_bal_match = re.search(r"Opening\s+Balance\s+([\d,]+\.\d{2})", full_text, re.IGNORECASE)
-    running_balance = _hdfc_clean_amount(open_bal_match.group(1)) if open_bal_match else 0.0
+    # For big PDFs, split into chunks, parse each, merge results
+    if total_pages > HDFC_CHUNK_SIZE and PIKEPDF_AVAILABLE:
+        chunk_paths = _split_pdf_into_chunks(pdf_path, HDFC_CHUNK_SIZE, password)
+    else:
+        chunk_paths = [pdf_path]
 
-    blocks = _hdfc_extract_blocks(full_text, is_ocr)
-    rows = []
-    problem_lines = []
+    all_rows = []
+    all_problem_lines = []
+    running_balance = 0.0
+    combined_method = "text"
+    combined_metadata = {"opening_balance": 0.0, "exp_dr_sum": 0.0, "exp_cr_sum": 0.0}
 
-    for b in blocks:
-        row, running_balance = _hdfc_parse_row(b, running_balance, is_ocr)
-        if row:
-            rows.append(row)
-        else:
-            problem_lines.append({"page": 0, "line": b[:120]})
+    for idx, chunk_path in enumerate(chunk_paths):
+        try:
+            full_text, is_ocr, _cp, method = _hdfc_extract_text_hybrid(
+                chunk_path, password if chunk_path == pdf_path else None, force_ocr=force_ocr
+            )
+            if is_ocr:
+                combined_method = "ocr"
 
-    # Extract summary metadata for verification
-    metadata = {"opening_balance": running_balance, "exp_dr_sum": 0.0, "exp_cr_sum": 0.0}
-    summary_pattern = re.compile(r"(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
-    summary_matches = summary_pattern.findall(full_text)
-    if summary_matches:
-        last_match = summary_matches[-1]
-        metadata["exp_dr_sum"] = _hdfc_clean_amount(last_match[2])
-        metadata["exp_cr_sum"] = _hdfc_clean_amount(last_match[3])
+            # Only extract opening balance from the first chunk
+            if idx == 0:
+                open_bal_match = re.search(r"Opening\s+Balance\s+([\d,]+\.\d{2})", full_text, re.IGNORECASE)
+                running_balance = _hdfc_clean_amount(open_bal_match.group(1)) if open_bal_match else 0.0
+                combined_metadata["opening_balance"] = running_balance
 
-    df = pd.DataFrame(rows)
-    return df, problem_lines, total_pages, metadata, method
+                # Extract summary metadata from first chunk text
+                summary_pattern = re.compile(r"(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
+                summary_matches = summary_pattern.findall(full_text)
+                if summary_matches:
+                    last_match = summary_matches[-1]
+                    combined_metadata["exp_dr_sum"] = _hdfc_clean_amount(last_match[2])
+                    combined_metadata["exp_cr_sum"] = _hdfc_clean_amount(last_match[3])
+
+            blocks = _hdfc_extract_blocks(full_text, is_ocr)
+
+            for b in blocks:
+                row, running_balance = _hdfc_parse_row(b, running_balance, is_ocr)
+                if row:
+                    all_rows.append(row)
+                else:
+                    all_problem_lines.append({"page": 0, "line": b[:120]})
+
+            # Also check later chunks for summary metadata
+            if idx > 0:
+                summary_pattern = re.compile(r"(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
+                summary_matches = summary_pattern.findall(full_text)
+                if summary_matches:
+                    last_match = summary_matches[-1]
+                    combined_metadata["exp_dr_sum"] = _hdfc_clean_amount(last_match[2])
+                    combined_metadata["exp_cr_sum"] = _hdfc_clean_amount(last_match[3])
+        finally:
+            # Clean up temp chunk files
+            if chunk_path != pdf_path:
+                try:
+                    os.unlink(chunk_path)
+                except Exception:
+                    pass
+
+    df = pd.DataFrame(all_rows)
+    return df, all_problem_lines, total_pages, combined_metadata, combined_method
 
 
 def add_hdfc_total_row(df: pd.DataFrame) -> pd.DataFrame:
