@@ -418,10 +418,12 @@ def add_pms_total_row(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 # =============================================================================
-# ── KOTAK BANK TEXT-MODE PARSER ───────────────────────────────────────────────
+# ── KOTAK PARSERS (ported from reference local code with high fidelity)
 # =============================================================================
 
 from dateutil import parser as dateparser
+
+# ── REGEX & CONSTANTS (matching reference exactly) ──
 
 BANK_DATE_LINE_RE = re.compile(r"^(\d{1,2}\s+[A-Za-z]{3,9},?\s+\d{4})\s+(.*)$")
 BANK_MONEY_RE     = re.compile(r"[+-]?\d{1,3}(?:,\d{3})*(?:\.\d{2})")
@@ -429,17 +431,51 @@ BANK_REF_RE       = re.compile(
     r"(UPI-\d{10,}|NEFTINW-\d+|IMPS-\d+|ONBF-[A-Za-z0-9]+|\b\d{9,}\b)", re.IGNORECASE
 )
 BANK_TABLE_HEADER_RE = re.compile(r"date\s+transaction\s+details", re.IGNORECASE)
-TABLE_END_RE      = re.compile(
-    r"(most\s*important\s*terms|mitc|terms\s*and\s*conditions|schedule\s*of\s*charges"
-    r"|grievance|ombudsman|disclaimer|customer\s*care|important\s*information"
-    r"|rewards?\s+point|finance\s*charges|interest\s+rate|late\s*payment\s*fee"
-    r"|nomination\s+form|registered\s+office|cin\s*:"
-    r"|note\s*:\s*this|this\s+is\s+a\s+computer\s+generated"
-    r"|e\s*&\s*o\.?\s*e|errors?\s+and\s+omissions)",
+
+# Table gating
+TXN_HEADER_RE = re.compile(r"transaction\s+details", re.IGNORECASE)
+TABLE_END_RE = re.compile(
+    r"(most\s*important\s*terms|mitc|terms\s*and\s*conditions|"
+    r"schedule\s*of\s*charges|grievance|ombudsman|disclaimer|"
+    r"customer\s*care|important\s*information|rewards?|points?|"
+    r"finance\s*charges|interest|fees|charges|late\s*payment)",
     re.IGNORECASE
 )
-PAGE_FOOTER_RE    = re.compile(r"page\s+\d+\s+of\s+\d+", re.IGNORECASE)
+PAGE_FOOTER_RE = re.compile(r"page\s+\d+\s+of\s+\d+", re.IGNORECASE)
 
+# Strong footer/bottom block stopper
+FOOTER_BLOCK_RE = re.compile(
+    r"(pay\s+your\s+credit\s+card\s+bills|what\s+you\s+must\s+know|"
+    r"kotak\s+mahindra\s+bank\s+limited|contact\s+us|customer\s+care|"
+    r"download\s+the\s+app|mobile\s+banking|net\s+banking|"
+    r"\*?\s*sms\s+emi|convert\s+your\s+transactions\s+into\s+emi|"
+    r"payment\s+of\s+only\s+minimum\s+dues|outstanding\s+balances|"
+    r"terms\s+and\s+conditions|disclaimer|grievance|ombudsman|"
+    r"registered\s+office|cin\s*:|important\s+information)",
+    re.IGNORECASE
+)
+
+# Credit card regexes
+CC_DATE_RE = re.compile(r"^(\d{1,2})[\/\-\s](\d{1,2})[\/\-\s](\d{2,4})\s+(.*)$")
+AMOUNT_RE  = re.compile(r"\d[\d,]*\.\d{2}")
+AMOUNT_ONLY = re.compile(r"^\s*(\d[\d,]*\.\d{2})\s*(Cr|CR|C\s*r)?\s*$")
+
+FX_ONLY_RE = re.compile(
+    r"^\s*\(?\s*\d[\d,]*\.\d{2}\s*(EUR|USD|GBP|AED|SGD|CAD|AUD|CHF|JPY|CNY)\s*\)?\s*$",
+    re.IGNORECASE
+)
+
+SECTION_HDR_RE = re.compile(
+    r"^(payments?\s+and\s+other\s+credits|primary\s+card\s+transactions.*|"
+    r"retail\s+purchases\s+and\s+cash\s+transactions|other\s+charges|"
+    r"other\s+fees\s+and\s+charges|fees\s+and\s+charges|finance\s+charges|"
+    r"interest\s+charges|total\s+purchase\s*&\s*other\s+charges|"
+    r"total\s+purchase\s+&\s+other\s+charges)$",
+    re.IGNORECASE
+)
+
+
+# ── COMMON HELPERS (matching reference) ──
 
 def parse_any_date(s: str):
     s = clean(s)
@@ -469,38 +505,83 @@ def bank_split_desc_ref(text: str):
     return clean(text[:last.start()] + " " + text[last.end():]), clean(last.group(1))
 
 
-BANK_FOOTER_RE = re.compile(
-    r"(kotak|mahindra|bank\s+limited|customer\s+care|download\s+the\s+app"
-    r"|registered\s+office|cin\s*:|branch\s+code|ifsc|micr"
-    r"|www\.|http|@|toll\s*free|helpline|contact\s+us"
-    r"|this\s+is\s+a\s+computer\s+generated|digitally\s+signed"
-    r"|note\s*:|important\s*:|disclaimer|subject\s+to"
-    r"|e\s*&\s*o\.?\s*e|errors?\s+and\s+omissions"
-    r"|nomination\s+|nominee|insurance|mutual\s+fund"
-    r"|rbi\b|reserve\s+bank|sebi\b|deposit\s+insurance"
-    r"|contents\s+of\s+this|do\s+not\s+share|otp"
-    r"|^\*{2,}|^-{3,}|^_{3,}|^\={3,})",
-    re.IGNORECASE,
-)
-
-def is_bad_bank_line(line: str) -> bool:
+def is_footerish_line(line: str) -> bool:
+    """Reference: prevents footer append."""
     line = clean(line)
     if not line:
         return True
     if PAGE_FOOTER_RE.search(line):
         return True
-    if re.search(r"^summary\b", line, re.IGNORECASE):
+    if FOOTER_BLOCK_RE.search(line):
         return True
-    if BANK_FOOTER_RE.search(line):
+    if re.fullmatch(r"\d+\s*(of|/)\s*\d+", line, flags=re.IGNORECASE):
         return True
-    # Lines that are all-caps with no numbers and no date pattern — likely headers/footers
-    if line.isupper() and not re.search(r"\d", line) and len(line) > 10:
-        return True
-    # Lines with long digit-only strings (account numbers, IDs in footers)
-    if re.search(r"\b\d{12,}\b", line) and not BANK_DATE_LINE_RE.match(line):
+    if re.search(r"(kotak|mahindra|bank|customer\s+care|download\s+the\s+app)", line, re.IGNORECASE):
         return True
     return False
 
+
+def is_bad_continuation_line(line: str) -> bool:
+    """Reference: for CC continuation lines."""
+    line = clean(line)
+    if not line:
+        return True
+    if is_footerish_line(line):
+        return True
+    if TABLE_END_RE.search(line):
+        return True
+    return False
+
+
+def is_bad_bank_continuation(line: str) -> bool:
+    """Reference: for bank continuation lines."""
+    line = clean(line)
+    if not line:
+        return True
+    if is_footerish_line(line):
+        return True
+    if re.search(r"^summary\b", line, re.IGNORECASE):
+        return True
+    return False
+
+
+# ── TABLE BLOCKS FROM OCR TEXT (reference logic) ──
+
+def extract_table_blocks_from_pages_text(pages_text: list[str]) -> list[list[str]]:
+    """
+    Tables = blocks that start after a line containing 'transaction details'
+    and end at rules/terms/disclaimer headers or footer blocks.
+    """
+    tables = []
+    current = []
+    in_table = False
+    for txt in pages_text:
+        if not txt:
+            continue
+        for raw in txt.splitlines():
+            line = clean(raw)
+            if not line:
+                continue
+            if not in_table and TXN_HEADER_RE.search(line):
+                in_table = True
+                current = []
+                continue
+            if in_table:
+                if TABLE_END_RE.search(line) or FOOTER_BLOCK_RE.search(line):
+                    if current:
+                        tables.append(current)
+                    in_table = False
+                    current = []
+                    continue
+                if PAGE_FOOTER_RE.search(line):
+                    continue
+                current.append(line)
+    if in_table and current:
+        tables.append(current)
+    return tables
+
+
+# ── BANK TEXT-MODE PARSER (reference: extract_kotak_bank_statement_text) ──
 
 def _looks_like_kotak_txn_line(line: str) -> bool:
     if not BANK_DATE_LINE_RE.match(line):
@@ -509,6 +590,7 @@ def _looks_like_kotak_txn_line(line: str) -> bool:
 
 
 def parse_kotak_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False) -> pd.DataFrame:
+    """Reference logic: try text mode first, then OCR with table blocks."""
     rows = []
     capture = False
 
@@ -521,7 +603,7 @@ def parse_kotak_bank(pdf_path: str, password: Optional[str] = None, force_ocr: b
             line = clean(raw)
             if not line:
                 continue
-            if not capture and BANK_TABLE_HEADER_RE.search(line):
+            if not capture and re.search(r"DATE\s+TRANSACTION\s+DETAILS", line, flags=re.IGNORECASE):
                 capture = True
                 continue
 
@@ -535,7 +617,7 @@ def parse_kotak_bank(pdf_path: str, password: Optional[str] = None, force_ocr: b
                 continue
             m = BANK_DATE_LINE_RE.match(line)
             if not m:
-                if rows and not is_bad_bank_line(line):
+                if rows and not is_bad_bank_continuation(line):
                     rows[-1]["Description"] = clean(rows[-1]["Description"] + " " + line)
                 continue
             dt_raw, rest = m.group(1), m.group(2)
@@ -555,7 +637,7 @@ def parse_kotak_bank(pdf_path: str, password: Optional[str] = None, force_ocr: b
             if txn_amt is not None:
                 if txn_amt < 0:
                     debit = abs(txn_amt)
-                else:
+                elif txn_amt > 0:
                     credit = txn_amt
             rows.append({"TxnDate": txn_date, "Description": desc, "Reference": ref,
                          "Debit": debit, "Credit": credit, "Balance": balance})
@@ -565,420 +647,188 @@ def parse_kotak_bank(pdf_path: str, password: Optional[str] = None, force_ocr: b
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df, total_pages, extraction_method
 
-# =============================================================================
-# ── KOTAK CREDIT CARD OCR PARSER ─────────────────────────────────────────────
-# =============================================================================
 
-CC_DATE_RE    = re.compile(r"^(\d{1,2})[\/\-\s](\d{1,2})[\/\-\s](\d{2,4})\s+(.*)$")
-AMOUNT_RE     = re.compile(r"\d[\d,]*\.\d{2}")
-AMOUNT_ONLY   = re.compile(r"^\s*(\d[\d,]*\.\d{2})\s*(Cr|CR|C\s*r)?\s*$")
-FX_ONLY_RE    = re.compile(
-    r"^\s*\(?\s*\d[\d,]*\.\d{2}\s*(EUR|USD|GBP|AED|SGD|CAD|AUD|CHF|JPY|CNY)\s*\)?\s*$",
-    re.IGNORECASE
-)
-SECTION_HDR_RE = re.compile(
-    r"^(payments?\s+and\s+other\s+credits|primary\s+card\s+transactions.*|"
-    r"retail\s+purchases\s+and\s+cash\s+transactions|other\s+charges|"
-    r"other\s+fees\s+and\s+charges|fees\s+and\s+charges|finance\s+charges|"
-    r"interest\s+charges|total\s+purchase\s*&\s*other\s+charges|"
-    r"total\s+purchase\s+&\s+other\s+charges|total\s+due|"
-    r"previous\s+balance|new\s+charges|adjustments)$",
-    re.IGNORECASE
-)
-FOOTER_BLOCK_RE = re.compile(
-    r"(pay\s+your\s+credit\s+card\s+bills|what\s+you\s+must\s+know|"
-    r"kotak\s+mahindra\s+bank\s+limited|contact\s+us|customer\s+care|"
-    r"download\s+the\s+app|mobile\s+banking|net\s+banking|"
-    r"\*?\s*sms\s+emi|convert\s+your\s+transactions\s+into\s+emi|"
-    r"payment\s+of\s+only\s+minimum\s+dues|outstanding\s+balances|"
-    r"terms\s+and\s+conditions|disclaimer|grievance|ombudsman|"
-    r"registered\s+office|cin\s*:|important\s+information)",
-    re.IGNORECASE
-)
-TXN_HEADER_RE  = re.compile(r"(transaction\s+details|date\s+.*description\s+.*amount)", re.IGNORECASE)
-# Additional pattern to detect statement summary/total lines to skip
-SUMMARY_LINE_RE = re.compile(
-    r"(total\s+amount\s+due|minimum\s+amount\s+due|last\s+payment|"
-    r"opening\s+balance|closing\s+balance|credit\s+limit|available\s+limit|"
-    r"reward\s+point|statement\s+date|payment\s+due\s+date|"
-    r"statement\s+period|billing\s+cycle)",
-    re.IGNORECASE
-)
+# ── CREDIT CARD OCR PARSER (reference: parse_credit_card_table_lines) ──
 
+def parse_cc_lines(lines: list[str]) -> pd.DataFrame:
+    """
+    Reference logic exactly:
+    - Prevents footer from appending to previous description
+    - Includes section headers as their own rows
+    - Merges GST label + amount-only next line
+    - FX bracket lines appended to previous row
+    """
+    rows = []
+    last_date = None
+    pending_section = ""
+    pending_label = ""
 
-def _estimate_gs_timeout(page_count: int) -> int:
-    upper_bound = max(CONVERT_TIMEOUT_SECS - 20, GS_TIMEOUT_BASE_SECS)
-    if page_count <= 0:
-        return GS_TIMEOUT_BASE_SECS
-    return min(upper_bound, max(GS_TIMEOUT_BASE_SECS, page_count * 20))
-
-
-def _normalize_ocr_text(text: str) -> str:
-    if not text:
-        return ""
-
-    normalized_lines = []
-    for raw_line in text.splitlines():
-        line = raw_line.replace("₹", " ").replace("|", " ").replace("¦", " ")
-        line = line.replace("—", "-").replace("–", "-")
-        line = line.replace("'", "").replace("`", "").replace("'", "")
-        line = re.sub(r"\s+", " ", line).strip()
+    for raw in lines:
+        line = clean(raw)
         if not line:
             continue
 
-        # Common OCR digit substitutions
-        line = re.sub(r"(?<=\d)[oO](?=\d)", "0", line)
-        line = re.sub(r"(?<=\d)[lI](?=\d)", "1", line)
-        line = re.sub(r"(?<=\d)[sS](?=\d)", "5", line)
-        line = re.sub(r"(?<=\d)[B](?=\d)", "8", line)
-        line = re.sub(r"(?<=\d)[G](?=\d)", "6", line)
-
-        # Fix spaces inside amounts: "1, 234.56" → "1,234.56", "12,3 45.67" → "12,345.67"
-        line = re.sub(r"(\d),\s+(\d{3})", r"\1,\2", line)           # "1, 234" → "1,234"
-        line = re.sub(r"(\d{1,3},\d)\s+(\d{2}[.,]\d{2})", r"\1\2", line)  # "12,3 45.67" → "12,345.67"
-        line = re.sub(r"(\d)\s+(\.\d{2})\b", r"\1\2", line)          # "1234 .56" → "1234.56"
-        line = re.sub(r"(\d{1,3}(?:,\d{3})*)\s*\.\s*(\d{2})\b", r"\1.\2", line)  # spaces around decimal
-
-        # Fix dates: various OCR date formats to dd/mm/yy
-        line = re.sub(r"(\d{1,2})[.\s](\d{1,2})[.\s](\d{2,4})(?=\b)", r"\1/\2/\3", line)
-        # Fix dates with extra spaces: "01 /02/24" → "01/02/24"
-        line = re.sub(r"(\d{2})\s*/\s*(\d{2})\s*/\s*(\d{2,4})", r"\1/\2/\3", line)
-
-        normalized_lines.append(line)
-
-    return "\n".join(normalized_lines)
-
-
-def _ocr_quality_score(text: str) -> int:
-    if not text:
-        return 0
-    compact = text.replace("\n", " ").strip()
-    char_count = len(compact)
-    date_hits = len(OCR_DATE_HINT_RE.findall(text))
-    amount_hits = len(OCR_AMOUNT_HINT_RE.findall(text))
-    return char_count + (date_hits * 60) + (amount_hits * 20)
-
-
-def _ocr_image_to_text(img: Image.Image) -> str:
-    primary_raw = pytesseract.image_to_string(
-        img,
-        config="--oem 3 --psm 4 -c preserve_interword_spaces=1",
-        timeout=35,
-    ) or ""
-    primary = _normalize_ocr_text(primary_raw)
-
-    if _ocr_quality_score(primary) >= 140 and OCR_DATE_HINT_RE.search(primary):
-        return primary
-
-    fallback_raw = pytesseract.image_to_string(
-        img,
-        config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
-        timeout=35,
-    ) or ""
-    fallback = _normalize_ocr_text(fallback_raw)
-
-    return fallback if _ocr_quality_score(fallback) > _ocr_quality_score(primary) else primary
-
-
-def _ocr_pdf_batch(
-    pdf_path: str,
-    gs_path: str,
-    dpi: int,
-    gs_timeout: int,
-    password: Optional[str] = None,
-) -> list[str]:
-    """Fallback OCR mode: rasterize all pages in one Ghostscript run."""
-    with tempfile.TemporaryDirectory() as tmp:
-        out_pattern = os.path.join(tmp, "page_%03d.png")
-        cmd = [
-            gs_path,
-            "-q",
-            "-dSAFER",
-            "-dBATCH",
-            "-dNOPAUSE",
-            f"-r{dpi}",
-            "-sDEVICE=png16m",
-            f"-sOutputFile={out_pattern}",
-        ]
-        if password:
-            cmd.append(f"-sPDFPassword={password}")
-        cmd.append(pdf_path)
-
-        subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=gs_timeout,
-        )
-
-        image_files = sorted(f for f in os.listdir(tmp) if f.endswith(".png"))
-        if not image_files:
-            raise RuntimeError("Ghostscript produced no rasterized pages for OCR")
-
-        pages_text = []
-        for fn in image_files:
-            image_path = os.path.join(tmp, fn)
-            try:
-                with Image.open(image_path) as img:
-                    text = _ocr_image_to_text(img)
-                pages_text.append(text)
-            except RuntimeError:
-                pages_text.append("")
-
-        return pages_text
-
-
-PDF_OCR_CHUNK_SIZE = 10  # pages per chunk for OCR splitting
-
-
-def _split_pdf_for_ocr(pdf_path: str, chunk_size: int, password: Optional[str] = None) -> list[str]:
-    """Split a large PDF into temp chunk files for OCR. Returns list of paths (cleaned up by caller)."""
-    if not PIKEPDF_AVAILABLE:
-        return [pdf_path]
-    try:
-        open_kw = {"password": password} if password else {}
-        src = pikepdf.open(pdf_path, **open_kw)
-    except Exception:
-        return [pdf_path]
-
-    total = len(src.pages)
-    if total <= chunk_size:
-        src.close()
-        return [pdf_path]
-
-    chunk_paths = []
-    for start in range(0, total, chunk_size):
-        end = min(start + chunk_size, total)
-        chunk_pdf = pikepdf.Pdf.new()
-        for i in range(start, end):
-            chunk_pdf.pages.append(src.pages[i])
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        chunk_pdf.save(tmp.name)
-        chunk_pdf.close()
-        chunk_paths.append(tmp.name)
-    src.close()
-    return chunk_paths
-
-
-def ocr_pdf(pdf_path: str, password: Optional[str] = None) -> list[str]:
-    """OCR all pages of a PDF, splitting into chunks for large files."""
-    if not OCR_AVAILABLE:
-        raise RuntimeError("pytesseract / Pillow not installed")
-
-    gs_path = shutil.which(GS_EXE) or GS_EXE
-    tess_path = shutil.which(TESSERACT_EXE) or TESSERACT_EXE
-    if not shutil.which(gs_path) and not os.path.exists(gs_path):
-        raise RuntimeError(f"Ghostscript not found: {GS_EXE}")
-    if not shutil.which(tess_path) and not os.path.exists(tess_path):
-        raise RuntimeError(f"Tesseract not found: {TESSERACT_EXE}")
-    pytesseract.pytesseract.tesseract_cmd = tess_path
-
-    page_count = 0
-    try:
-        open_kwargs = {"path_or_fp": pdf_path}
-        if password:
-            open_kwargs["password"] = password
-        with pdfplumber.open(**open_kwargs) as pdf:
-            page_count = len(pdf.pages)
-    except Exception:
-        page_count = 0
-
-    dpi = OCR_DPI_LARGE_DOC if page_count >= OCR_HIGH_PAGE_COUNT else OCR_DPI
-
-    # Split large PDFs into chunks for reliable OCR
-    chunk_paths = _split_pdf_for_ocr(pdf_path, PDF_OCR_CHUNK_SIZE, password)
-    all_pages_text = []
-
-    for chunk_path in chunk_paths:
-        try:
-            chunk_page_count = 0
-            try:
-                with pdfplumber.open(chunk_path) as cpdf:
-                    chunk_page_count = len(cpdf.pages)
-            except Exception:
-                chunk_page_count = PDF_OCR_CHUNK_SIZE
-            gs_timeout = _estimate_gs_timeout(chunk_page_count)
-            # Don't pass password for split chunks (already decrypted by pikepdf)
-            chunk_pw = password if chunk_path == pdf_path else None
-            pages = _ocr_pdf_batch(chunk_path, gs_path, dpi, gs_timeout, chunk_pw)
-            all_pages_text.extend(pages)
-        finally:
-            if chunk_path != pdf_path:
-                try:
-                    os.unlink(chunk_path)
-                except Exception:
-                    pass
-
-    return all_pages_text
-
-
-def _safe_rows_json(df: pd.DataFrame) -> list[dict]:
-    """Serialize dataframe rows safely for JSON (NaN/Inf -> None)."""
-    import math
-
-    rows_json = df.where(df.notna(), other=None).to_dict(orient="records")
-    for row in rows_json:
-        for k, v in row.items():
-            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-                row[k] = None
-    return rows_json
-
-
-
-
-def extract_pdf_pages_text(pdf_path: str, password: Optional[str] = None,
-                           x_tolerance: int = 2, y_tolerance: int = 2,
-                           force_ocr: bool = False) -> tuple[list[str], str]:
-    """
-    Extract text from each page of a PDF using pdfplumber.
-    Falls back to OCR if pdfplumber yields very little usable text.
-    Returns (list_of_page_texts, method) where method is 'text' or 'ocr'.
-    """
-    open_kwargs = {"path_or_fp": pdf_path}
-    if password:
-        open_kwargs["password"] = password
-
-    pages_text = []
-    try:
-        with pdfplumber.open(**open_kwargs) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text(x_tolerance=x_tolerance, y_tolerance=y_tolerance) or ""
-                pages_text.append(text)
-    except Exception:
-        pages_text = []
-
-    # Check if pdfplumber yielded enough text — if not, fall back to OCR
-    total_chars = sum(len(t.strip()) for t in pages_text)
-    has_date = any(re.search(r"\d{2}[\/\-]\d{2}[\/\-]\d{2,4}", t) for t in pages_text if t)
-    should_try_ocr = force_ocr or total_chars < 100 or not has_date
-    if should_try_ocr:
-        if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)):
-            try:
-                ocr_pages = ocr_pdf(pdf_path, password)
-                ocr_pages = [_normalize_ocr_text(t) for t in ocr_pages]
-                ocr_chars = sum(len(t.strip()) for t in ocr_pages)
-                ocr_has_date = any(re.search(r"\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}", t) for t in ocr_pages if t)
-
-                if force_ocr and ocr_pages:
-                    return ocr_pages, "ocr"
-
-                if ocr_pages and ocr_chars >= max(int(total_chars * 0.8), 60) and (ocr_has_date or not has_date):
-                    return ocr_pages, "ocr"
-            except Exception:
-                pass
-
-    return pages_text, "text"
-
-
-def extract_cc_blocks(pages_text: list[str]) -> list[list[str]]:
-    tables, current, in_table = [], [], False
-    for txt in pages_text:
-        for raw in (txt or "").splitlines():
-            line = clean(raw)
-            if not line:
-                continue
-            if not in_table and TXN_HEADER_RE.search(line):
-                in_table, current = True, []
-                continue
-            if in_table:
-                if TABLE_END_RE.search(line) or FOOTER_BLOCK_RE.search(line):
-                    if current:
-                        tables.append(current)
-                    in_table, current = False, []
-                    continue
-                if PAGE_FOOTER_RE.search(line):
-                    continue
-                current.append(line)
-    if in_table and current:
-        tables.append(current)
-    return tables
-
-
-def parse_cc_lines(lines: list[str]) -> pd.DataFrame:
-    rows, last_date, pending_section, pending_label = [], None, "", ""
-    for raw in lines:
-        line = clean(raw)
-        if not line or FOOTER_BLOCK_RE.search(line) or PAGE_FOOTER_RE.search(line):
+        # hard stop if footer block begins
+        if FOOTER_BLOCK_RE.search(line):
+            break
+        if PAGE_FOOTER_RE.search(line):
             continue
-        # Skip summary/info lines
-        if SUMMARY_LINE_RE.search(line):
-            continue
+
+        # Include section headers as their own row
         if SECTION_HDR_RE.match(line):
             pending_section = line
-            rows.append({"TxnDate": last_date, "TransactionDetails": line,
-                         "SpendsArea": "", "Debit": None, "Credit": None})
+            rows.append({
+                "TxnDate": last_date,
+                "TransactionDetails": line,
+                "SpendsArea": "",
+                "Debit": None,
+                "Credit": None
+            })
             continue
+
+        # FX-only line -> append to previous transaction details
         if FX_ONLY_RE.match(line):
             if rows:
                 rows[-1]["TransactionDetails"] = clean(rows[-1]["TransactionDetails"] + " " + line)
             continue
+
+        # Date row
         m = CC_DATE_RE.match(line)
         if m:
             dd, mm, yyyy, rest = m.group(1), m.group(2), m.group(3), m.group(4)
-            # Handle 2-digit years
             if len(yyyy) == 2:
                 yyyy = "20" + yyyy if int(yyyy) < 50 else "19" + yyyy
             txn_date = parse_any_date(f"{dd}/{mm}/{yyyy}")
             if txn_date is None:
-                # Try swapping dd/mm in case OCR misread
                 txn_date = parse_any_date(f"{mm}/{dd}/{yyyy}")
-            last_date, pending_label = txn_date, ""
+            last_date = txn_date
+            pending_label = ""
+
             amts = AMOUNT_RE.findall(rest)
             if not amts:
                 pending_label = clean(rest)
                 continue
+
             amt = parse_amount(amts[-1])
             if amt is None:
                 continue
-            is_cr = bool(re.search(r"\bCr\b|\bCR\b|\bcredit\b", rest, re.IGNORECASE))
-            rest_c = re.sub(r"\bCr\b|\bCR\b", "", rest).strip()
-            pos = rest_c.rfind(amts[-1])
-            left = clean(rest_c[:pos]) if pos != -1 else clean(rest_c)
+
+            is_credit = bool(re.search(r"\bCr\b|\bCR\b|\bC\s*r\b", rest))
+            rest_clean = re.sub(r"\bCr\b|\bCR\b|\bC\s*r\b", "", rest).strip()
+            pos = rest_clean.rfind(amts[-1])
+            left = clean(rest_clean[:pos]) if pos != -1 else clean(rest_clean)
+
+            # spends area heuristic
+            spends_area = ""
             toks = left.split()
             if toks and toks[-1].isalpha() and len(toks[-1]) <= 20:
-                spends_area, details = toks[-1], clean(" ".join(toks[:-1]))
+                spends_area = toks[-1]
+                details = clean(" ".join(toks[:-1]))
             else:
-                spends_area, details = "", left
-            # Don't prepend section header to details — keep them clean
-            rows.append({"TxnDate": txn_date, "TransactionDetails": details,
-                         "SpendsArea": spends_area,
-                         "Debit": None if is_cr else amt,
-                         "Credit": amt if is_cr else None})
+                details = left
+
+            # attach pending section to details
+            if pending_section:
+                details = clean(pending_section + " " + details)
+
+            debit = credit = None
+            if is_credit:
+                credit = amt
+            else:
+                debit = amt
+
+            rows.append({
+                "TxnDate": txn_date,
+                "TransactionDetails": details,
+                "SpendsArea": spends_area,
+                "Debit": debit,
+                "Credit": credit
+            })
             continue
+
+        # Amount-only line (GST amount split)
         mo = AMOUNT_ONLY.match(line)
         if mo and last_date:
             amt = parse_amount(mo.group(1))
-            if amt is None or not pending_label:
-                if rows:
+            if amt is None:
+                continue
+            is_credit = bool(mo.group(2))
+            label = pending_label
+            pending_label = ""
+
+            if not label:
+                # safest: append amount to previous row
+                if rows and not is_bad_continuation_line(line):
                     rows[-1]["TransactionDetails"] = clean(rows[-1]["TransactionDetails"] + " " + line)
                 continue
-            is_cr = bool(mo.group(2))
-            label = clean(pending_label)
-            pending_label = ""
-            rows.append({"TxnDate": last_date, "TransactionDetails": label, "SpendsArea": "",
-                         "Debit": None if is_cr else amt, "Credit": amt if is_cr else None})
+
+            if pending_section:
+                label = clean(pending_section + " " + label)
+
+            debit = credit = None
+            if is_credit:
+                credit = amt
+            else:
+                debit = amt
+
+            rows.append({
+                "TxnDate": last_date,
+                "TransactionDetails": label,
+                "SpendsArea": "",
+                "Debit": debit,
+                "Credit": credit
+            })
             continue
+
+        # No-date line with amount somewhere
         amts2 = AMOUNT_RE.findall(line)
         if amts2 and last_date:
-            if re.search(r"\b(EUR|USD|GBP|AED|SGD|CAD)\b", line, re.IGNORECASE):
+            # currency lines -> append
+            if re.search(r"\b(EUR|USD|GBP|AED|SGD|CAD|AUD|CHF|JPY|CNY)\b", line, re.IGNORECASE):
                 if rows:
                     rows[-1]["TransactionDetails"] = clean(rows[-1]["TransactionDetails"] + " " + line)
                 continue
+
             amt = parse_amount(amts2[-1])
             if amt is None:
                 continue
-            is_cr = bool(re.search(r"\bCr\b|\bCR\b|\bcredit\b", line, re.IGNORECASE))
-            lc = re.sub(r"\bCr\b|\bCR\b", "", line).strip()
-            pos = lc.rfind(amts2[-1])
-            left = clean(lc[:pos]) if pos != -1 else clean(lc)
-            rows.append({"TxnDate": last_date, "TransactionDetails": left or line, "SpendsArea": "",
-                         "Debit": None if is_cr else amt, "Credit": amt if is_cr else None})
+            is_credit = bool(re.search(r"\bCr\b|\bCR\b|\bC\s*r\b", line))
+            line_clean = re.sub(r"\bCr\b|\bCR\b|\bC\s*r\b", "", line).strip()
+            pos = line_clean.rfind(amts2[-1])
+            left = clean(line_clean[:pos]) if pos != -1 else clean(line_clean)
+
+            if left and len(left.split()) <= 6 and not rows:
+                pending_label = left
+                continue
+
+            if pending_section and left:
+                left = clean(pending_section + " " + left)
+
+            debit = credit = None
+            if is_credit:
+                credit = amt
+            else:
+                debit = amt
+
+            rows.append({
+                "TxnDate": last_date,
+                "TransactionDetails": left if left else line,
+                "SpendsArea": "",
+                "Debit": debit,
+                "Credit": credit
+            })
             continue
-        # Only merge short text into pending_label — avoid absorbing garbage
-        if len(line.split()) <= 6 and re.search(r"[A-Za-z]", line) and not re.search(r"\d{5,}", line):
+
+        # Plain text line: decide label vs continuation, but NEVER append footer
+        if is_bad_continuation_line(line):
+            continue
+
+        # Short charge label before amount (e.g., "GST")
+        if len(line.split()) <= 6 and re.search(r"[A-Za-z]", line):
             pending_label = clean((pending_label + " " + line).strip())
             continue
+
+        # otherwise, safe continuation
         if rows:
             rows[-1]["TransactionDetails"] = clean(rows[-1]["TransactionDetails"] + " " + line)
 
@@ -989,17 +839,74 @@ def parse_cc_lines(lines: list[str]) -> pd.DataFrame:
     return df
 
 
+# ── BANK OCR PARSER (reference: parse_bank_table_lines) ──
+
+def parse_bank_table_lines(lines: list[str]) -> pd.DataFrame:
+    """Reference logic: parse bank statement lines from OCR table blocks."""
+    BANK_DATE_FLEX_RE = re.compile(r"^(\d{2}\s+[A-Za-z]{3},?\s+\d{4})\s+(.*)$")
+    BANK_MONEY_FLEX_RE = re.compile(r"[+-]?\d[\d,]*\.\d{2}")
+
+    rows = []
+    for raw in lines:
+        line = clean(raw)
+        if not line:
+            continue
+        if is_footerish_line(line):
+            continue
+        m = BANK_DATE_FLEX_RE.match(line)
+        if not m:
+            if rows and not is_bad_bank_continuation(line):
+                rows[-1]["Description"] = clean(rows[-1]["Description"] + " " + line)
+            continue
+        date_raw, rest = m.group(1), m.group(2)
+        txn_date = parse_any_date(date_raw)
+        monies = BANK_MONEY_FLEX_RE.findall(rest)
+        if len(monies) < 2:
+            continue
+        txn_amt = parse_amount(monies[-2])
+        balance = parse_amount(monies[-1])
+        temp = rest
+        for tok in (monies[-1], monies[-2]):
+            pos = temp.rfind(tok)
+            if pos != -1:
+                temp = clean(temp[:pos])
+        desc, ref = bank_split_desc_ref(temp)
+        debit = credit = None
+        if txn_amt is not None:
+            if txn_amt < 0:
+                debit = abs(txn_amt)
+            elif txn_amt > 0:
+                credit = txn_amt
+        rows.append({
+            "TxnDate": txn_date,
+            "Description": desc,
+            "Reference": ref,
+            "Debit": debit,
+            "Credit": credit,
+            "Balance": balance
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        for c in ["Debit", "Credit", "Balance"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+# ── OUTPUT FORMATTERS ──
+
+CC_OUTPUT_COLS = ["Date", "Transaction Details", "Spends Area", "Debit", "Credit"]
+
 def format_cc_output(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["Date", "Transaction Details", "Spends Area", "Debit", "Credit"]
     if df.empty:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=CC_OUTPUT_COLS)
     out = pd.DataFrame()
     out["Date"]                = df.get("TxnDate", "").astype(str).apply(clean)
     out["Transaction Details"] = df.get("TransactionDetails", "").astype(str).apply(clean)
     out["Spends Area"]         = df.get("SpendsArea", "").astype(str).apply(clean)
     out["Debit"]               = pd.to_numeric(df.get("Debit"), errors="coerce")
     out["Credit"]              = pd.to_numeric(df.get("Credit"), errors="coerce")
-    return out[cols]
+    return out[CC_OUTPUT_COLS]
+
 
 # =============================================================================
 # ── HDFC BANK STATEMENT PARSER ───────────────────────────────────────────────
@@ -1812,7 +1719,7 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
 
         # ── KOTAK CREDIT CARD ────────────────────────────────────────────────
         elif mode == "kotak" and sub_mode == "cc":
-            # Kotak CC always uses OCR (scanned statements)
+            # Reference logic: OCR all pages, extract table blocks, parse as both CC and bank
             method = "cc_ocr"
             if not OCR_AVAILABLE:
                 raise HTTPException(500, "pytesseract / Pillow not installed on the server.")
@@ -1820,13 +1727,39 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
                 raise HTTPException(500, f"Ghostscript not found at: {GS_EXE}")
             pages_text = ocr_pdf(tmp_path, password)
             total_pages = len(pages_text)
-            blocks = extract_cc_blocks(pages_text)
-            all_cc = [parse_cc_lines(b) for b in blocks]
-            cc_combined = pd.concat([d for d in all_cc if not d.empty], ignore_index=True) \
-                          if any(not d.empty for d in all_cc) else pd.DataFrame()
-            df_out = format_cc_output(cc_combined)
+            blocks = extract_table_blocks_from_pages_text(pages_text)
+            print(f"[KOTAK CC] OCR pages: {total_pages}, table blocks found: {len(blocks)}")
+
+            # Parse ALL blocks as both CC and bank, then choose
+            all_cc = []
+            all_bk = []
+            for idx, block_lines in enumerate(blocks, start=1):
+                df_cc = parse_cc_lines(block_lines)
+                df_bk = parse_bank_table_lines(block_lines)
+                print(f"[KOTAK CC] Block#{idx}: cc_rows={len(df_cc)} bank_rows={len(df_bk)}")
+                if not df_cc.empty:
+                    all_cc.append(df_cc)
+                if not df_bk.empty:
+                    all_bk.append(df_bk)
+
+            df_cc_all = pd.concat(all_cc, ignore_index=True) if all_cc else pd.DataFrame()
+            df_bk_all = pd.concat(all_bk, ignore_index=True) if all_bk else pd.DataFrame()
+
+            # Choose: if CC has dated rows, prefer CC; otherwise bank
+            if not df_cc_all.empty and df_cc_all["TxnDate"].notna().sum() > 0:
+                df_out = format_cc_output(df_cc_all)
+                method = "credit_card_ocr_all_pages"
+                print(f"[KOTAK CC] Chosen: credit card OCR (rows={len(df_out)})")
+            elif not df_bk_all.empty:
+                df_out = df_bk_all
+                method = "bank_ocr_all_pages"
+                print(f"[KOTAK CC] Chosen: bank OCR (rows={len(df_out)})")
+            else:
+                df_out = pd.DataFrame()
+                problems.append("No usable table rows found in OCR blocks.")
+
             detail_total = float(
-                pd.to_numeric(df_out.get("Debit"), errors="coerce").fillna(0).sum()
+                pd.to_numeric(df_out.get("Debit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
             )
         # ── AIF ───────────────────────────────────────────────────────────
         elif mode == "aif":
