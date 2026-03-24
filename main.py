@@ -31,7 +31,7 @@ import pandas as pd
 import pdfplumber
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 # ── Optional OCR imports ──────────────────────────────────────────────────────
@@ -669,7 +669,7 @@ def _ocr_pdf_batch(
     """Fallback OCR mode: rasterize all pages in one Ghostscript run."""
     with tempfile.TemporaryDirectory() as tmp:
         out_pattern = os.path.join(tmp, "page_%03d.png")
-    cmd = [
+        cmd = [
             gs_path,
             "-q",
             "-dSAFER",
@@ -749,115 +749,6 @@ def _safe_rows_json(df: pd.DataFrame) -> list[dict]:
     return rows_json
 
 
-def _convert_kotak_cc_stream_sync(tmp_path: str, filename: str, password: Optional[str]):
-    """Yield NDJSON-compatible events while OCR/parsing Kotak CC."""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    method = "cc_ocr"
-    status = "UNKNOWN"
-    match_text = "Summary total not found (cannot compare)."
-    problems: list[dict] = []
-
-    if not OCR_AVAILABLE:
-        raise HTTPException(500, "pytesseract / Pillow not installed on the server.")
-    if not shutil.which(GS_EXE) and not os.path.exists(GS_EXE):
-        raise HTTPException(500, f"Ghostscript not found at: {GS_EXE}")
-    if not shutil.which(TESSERACT_EXE) and not os.path.exists(TESSERACT_EXE):
-        raise HTTPException(500, f"Tesseract not found at: {TESSERACT_EXE}")
-
-    total_pages_hint = 0
-    try:
-        open_kwargs = {"path_or_fp": tmp_path}
-        if password:
-            open_kwargs["password"] = password
-        with pdfplumber.open(**open_kwargs) as pdf:
-            total_pages_hint = len(pdf.pages)
-    except Exception:
-        total_pages_hint = 0
-
-    yield {
-        "type": "start",
-        "pdfName": filename,
-        "totalPages": total_pages_hint,
-        "mode": "cc",
-    }
-
-    # OCR all pages in one batch
-    pages_text = ocr_pdf(tmp_path, password)
-    total_pages_hint = max(total_pages_hint, len(pages_text))
-
-    blocks = extract_cc_blocks(pages_text)
-    all_cc = [parse_cc_lines(b) for b in blocks]
-    cc_combined = (
-        pd.concat([d for d in all_cc if not d.empty], ignore_index=True)
-        if any(not d.empty for d in all_cc)
-        else pd.DataFrame()
-    )
-    df_out = format_cc_output(cc_combined)
-
-    if df_out.empty or len(df_out) < MIN_ROWS:
-        raise HTTPException(
-            422,
-            f"Extraction produced fewer than {MIN_ROWS} rows. "
-            "Check that this is the right statement type.",
-        )
-
-    # Emit a single page event with all rows
-    rows_json = _safe_rows_json(df_out)
-    yield {
-        "type": "page",
-        "page": total_pages_hint,
-        "totalPages": total_pages_hint,
-        "rowsAdded": len(rows_json),
-        "rowsSoFar": len(rows_json),
-        "replaceRows": False,
-        "rows": rows_json,
-    }
-
-    stem = Path(filename).stem
-    xlsx_bytes = df_to_excel_bytes(df_out)
-    xml_bytes = df_to_xml_bytes(df_out)
-
-    xlsx_name = f"{stem}_transactions.xlsx"
-    xml_name = f"{stem}_transactions.xml"
-
-    (OUTPUT_DIR / xlsx_name).write_bytes(xlsx_bytes)
-    (OUTPUT_DIR / xml_name).write_bytes(xml_bytes)
-
-    xlsx_b64 = b64(xlsx_bytes)
-    xml_b64 = b64(xml_bytes)
-
-    detail_total = float(pd.to_numeric(df_out.get("Debit"), errors="coerce").fillna(0).sum()) if not df_out.empty else 0.0
-    summary_total = None
-
-    yield {
-        "type": "done",
-        "result": {
-            "ok": True,
-            "rows": rows_json,
-            "report": {
-                "pdfName": filename,
-                "runTime": now_str,
-                "pagesProcessed": total_pages_hint,
-                "rowsExtracted": len(rows_json),
-                "problemLines": problems,
-                "detailTotal": detail_total,
-                "summaryTotal": summary_total,
-                "status": status,
-                "matchText": match_text,
-                "method": method,
-                "outputFiles": {
-                    "excel": xlsx_name,
-                    "xml": xml_name,
-                    "report": f"{stem}_extraction_report.txt",
-                },
-                "mode": "cc",
-            },
-            "files": {
-                "xlsx": xlsx_b64,
-                "xml": xml_b64,
-            },
-        },
-    }
 
 
 def extract_pdf_pages_text(pdf_path: str, password: Optional[str] = None,
@@ -1540,79 +1431,6 @@ def add_axis_total_row(df: pd.DataFrame) -> pd.DataFrame:
 # ── /convert ENDPOINT ─────────────────────────────────────────────────────────
 # =============================================================================
 
-
-@app.post("/convert-stream")
-async def convert_stream(
-    request: Request,
-    file: UploadFile = File(...),
-    mode: str = Form(...),
-    sub_mode: str = Form(""),
-    password: Optional[str] = Form(None),
-):
-    """Stream page-by-page OCR updates for Kotak CC as newline-delimited JSON."""
-    _get_current_user(request)  # require authentication
-
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are accepted.")
-    if mode != "kotak" or sub_mode != "cc":
-        raise HTTPException(400, "Streaming is currently supported only for Kotak credit-card OCR mode.")
-
-    content = await file.read()
-    safe_name = _sanitize_filename(file.filename)
-    input_path = INPUT_DIR / safe_name
-    input_path.write_bytes(content)
-    tmp_path = str(input_path)
-
-    def _stream_events():
-        import json as _json
-
-        try:
-            for event in _convert_kotak_cc_stream_sync(tmp_path, file.filename, password):
-                yield _json.dumps(event, ensure_ascii=False) + "\n"
-        except HTTPException as e:
-            yield _json.dumps({
-                "type": "error",
-                "status": e.status_code,
-                "detail": str(e.detail),
-            }, ensure_ascii=False) + "\n"
-        except MemoryError:
-            gc.collect()
-            yield _json.dumps({
-                "type": "error",
-                "status": 507,
-                "detail": "Server ran out of memory processing this PDF. Try a smaller file or split the PDF.",
-            }, ensure_ascii=False) + "\n"
-        except subprocess.TimeoutExpired as e:
-            gc.collect()
-            timeout_secs = int(getattr(e, "timeout", 0) or 0)
-            yield _json.dumps({
-                "type": "error",
-                "status": 504,
-                "detail": f"OCR processing timed out after {timeout_secs} seconds. Try a smaller PDF.",
-            }, ensure_ascii=False) + "\n"
-        except Exception as e:
-            gc.collect()
-            yield _json.dumps({
-                "type": "error",
-                "status": 500,
-                "detail": f"Extraction failed: {repr(e)}",
-            }, ensure_ascii=False) + "\n"
-        finally:
-            try:
-                if input_path.exists():
-                    input_path.unlink()
-            except Exception:
-                pass
-            gc.collect()
-
-    return StreamingResponse(
-        _stream_events(),
-        media_type="application/x-ndjson",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 @app.post("/convert")
 async def convert(
