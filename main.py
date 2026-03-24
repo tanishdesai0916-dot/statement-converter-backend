@@ -621,14 +621,29 @@ def _normalize_ocr_text(text: str) -> str:
     for raw_line in text.splitlines():
         line = raw_line.replace("₹", " ").replace("|", " ").replace("¦", " ")
         line = line.replace("—", "-").replace("–", "-")
+        line = line.replace("'", "").replace("`", "").replace("'", "")
         line = re.sub(r"\s+", " ", line).strip()
         if not line:
             continue
 
+        # Common OCR digit substitutions
         line = re.sub(r"(?<=\d)[oO](?=\d)", "0", line)
         line = re.sub(r"(?<=\d)[lI](?=\d)", "1", line)
         line = re.sub(r"(?<=\d)[sS](?=\d)", "5", line)
+        line = re.sub(r"(?<=\d)[B](?=\d)", "8", line)
+        line = re.sub(r"(?<=\d)[G](?=\d)", "6", line)
+
+        # Fix spaces inside amounts: "1, 234.56" → "1,234.56", "12,3 45.67" → "12,345.67"
+        line = re.sub(r"(\d),\s+(\d{3})", r"\1,\2", line)           # "1, 234" → "1,234"
+        line = re.sub(r"(\d{1,3},\d)\s+(\d{2}[.,]\d{2})", r"\1\2", line)  # "12,3 45.67" → "12,345.67"
+        line = re.sub(r"(\d)\s+(\.\d{2})\b", r"\1\2", line)          # "1234 .56" → "1234.56"
+        line = re.sub(r"(\d{1,3}(?:,\d{3})*)\s*\.\s*(\d{2})\b", r"\1.\2", line)  # spaces around decimal
+
+        # Fix dates: various OCR date formats to dd/mm/yy
         line = re.sub(r"(\d{1,2})[.\s](\d{1,2})[.\s](\d{2,4})(?=\b)", r"\1/\2/\3", line)
+        # Fix dates with extra spaces: "01 /02/24" → "01/02/24"
+        line = re.sub(r"(\d{2})\s*/\s*(\d{2})\s*/\s*(\d{2,4})", r"\1/\2/\3", line)
+
         normalized_lines.append(line)
 
     return "\n".join(normalized_lines)
@@ -989,9 +1004,7 @@ def format_cc_output(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 # ── HDFC BANK STATEMENT PARSER ───────────────────────────────────────────────
 # =============================================================================
-
-# =============================================================================
-# ── HDFC BANK STATEMENT PARSER (with built-in OCR fallback) ──────────────────
+# Ported from reference local parser with high fidelity.
 # =============================================================================
 
 HDFC_DATE_START_RE = re.compile(r"^\d{2}/\d{2}/\d{2}")
@@ -999,9 +1012,9 @@ HDFC_DATE_ANY_RE   = re.compile(r"\d{2}/\d{2}/\d{2}")
 HDFC_AMOUNT_RE     = re.compile(r"(\d{1,3}(?:,\d{3})*\.\d{2})")
 
 HDFC_HEADER_TEXT       = "Date Narration Chq./Ref.No. ValueDt WithdrawalAmt. DepositAmt. ClosingBalance"
+HDFC_SUMMARY_START     = "STATEMENTSUMMARY :-"       # Standard Digital
+HDFC_SUMMARY_START_OCR = "STATEMENT SUMMARY :-"      # OCR with Space
 HDFC_FOOTER_START      = "HDFCBANKLIMITED"
-HDFC_SUMMARY_START     = "STATEMENTSUMMARY:-"       # Digital (no spaces)
-HDFC_SUMMARY_START_OCR = "STATEMENT SUMMARY :-"     # OCR (with spaces)
 
 
 def _hdfc_is_standalone_ref(token: str, is_ocr: bool) -> bool:
@@ -1018,8 +1031,43 @@ def _hdfc_clean_amount(x):
     return float(x or 0.0)
 
 
+def _hdfc_ocr_pdf_to_text(pdf_path: str, password: Optional[str] = None) -> str:
+    """OCR pipeline matching reference code: grayscale, PSM 6, clean brackets/pipes."""
+    gs_path = shutil.which(GS_EXE) or GS_EXE
+    tess_path = shutil.which(TESSERACT_EXE) or TESSERACT_EXE
+    pytesseract.pytesseract.tesseract_cmd = tess_path
+
+    with tempfile.TemporaryDirectory() as tmp_img_dir:
+        out_pattern = os.path.join(tmp_img_dir, "page_%03d.png")
+        cmd = [
+            gs_path, "-dSAFER", "-dBATCH", "-dNOPAUSE",
+            f"-r{OCR_DPI}", "-sDEVICE=png16m",
+            f"-sOutputFile={out_pattern}",
+        ]
+        if password:
+            cmd.append(f"-sPDFPassword={password}")
+        cmd.append(pdf_path)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=GS_TIMEOUT_BASE_SECS)
+
+        pngs = sorted(f for f in os.listdir(tmp_img_dir) if f.endswith(".png"))
+        if not pngs:
+            raise RuntimeError("Ghostscript produced no pages")
+
+        combined_text = ""
+        for fn in pngs:
+            img_path = os.path.join(tmp_img_dir, fn)
+            img = Image.open(img_path).convert("L")
+            text = pytesseract.image_to_string(img, config="--oem 3 --psm 6")
+            cleaned_text = text.replace("[", "").replace(")", "").replace("|", " ")
+            combined_text += cleaned_text + "\n"
+
+    return combined_text
+
+
 def _hdfc_extract_text_hybrid(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
-    """Try pdfplumber first, fall back to OCR only if text is insufficient."""
+    """Try pdfplumber first, fall back to OCR only if text is insufficient.
+    Matches reference: extract_text_hybrid logic exactly."""
     text = ""
     is_ocr = False
     total_pages = 0
@@ -1035,23 +1083,29 @@ def _hdfc_extract_text_hybrid(pdf_path: str, password: Optional[str] = None, for
     except Exception:
         pass
 
-    # Only fall back to OCR if pdfplumber yields very little text (or when forced)
     if force_ocr or not text or len(text.strip()) < 100 or "Date" not in text:
         is_ocr = True
-        if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)) and (shutil.which(TESSERACT_EXE) or os.path.exists(TESSERACT_EXE)):
+        print("[HDFC] Scanned PDF detected — building OCR database...")
+        if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)):
             try:
-                pages_text = ocr_pdf(pdf_path, password)
-                total_pages = len(pages_text)
-                text = "\n".join(_normalize_ocr_text(p) for p in pages_text)
-            except Exception:
-                pass
+                text = _hdfc_ocr_pdf_to_text(pdf_path, password)
+                # Count pages from OCR output
+                if not total_pages and PIKEPDF_AVAILABLE:
+                    try:
+                        open_kw = {"password": password} if password else {}
+                        with pikepdf.open(pdf_path, **open_kw) as ppdf:
+                            total_pages = len(ppdf.pages)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[HDFC] OCR failed: {e}")
 
     method = "ocr" if is_ocr else "text"
     return text, is_ocr, total_pages, method
 
 
 def _hdfc_extract_blocks(text: str, is_ocr: bool):
-    """Extract transaction blocks with dual hard-stop logic for digital vs OCR."""
+    """Extract transaction blocks — exact match to reference extract_transaction_blocks."""
     all_blocks = []
     current_block = ""
     start_recording = False
@@ -1062,28 +1116,30 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
         if not clean_line:
             continue
 
-        # 1. Recording start logic — for digital, skip repeated header lines
-        if not is_ocr:
+        # 1. Recording Start Logic
+        if is_ocr and not start_recording:
+            if HDFC_DATE_START_RE.match(clean_line):
+                start_recording = True
+        elif not is_ocr:
             if HDFC_HEADER_TEXT.replace(" ", "") in clean_line.replace(" ", ""):
                 start_recording = True
                 continue
-        elif not start_recording:
-            if HDFC_DATE_START_RE.match(clean_line):
-                start_recording = True
 
-        # 2. Dual hard-stop logic
+        # 2. Dual Block Hard Stop Logic
         if is_ocr:
             if HDFC_SUMMARY_START_OCR in clean_line:
                 if current_block:
                     all_blocks.append(current_block)
+                print("[HDFC] OCR hard stop reached at Statement Summary.")
                 break
         else:
-            if HDFC_SUMMARY_START in clean_line.replace(" ", ""):
+            if HDFC_SUMMARY_START in clean_line:
                 if current_block:
                     all_blocks.append(current_block)
+                print("[HDFC] Digital hard stop reached at Statement Summary.")
                 break
 
-        # 3. Footer skip logic
+        # 3. Footer Skip Logic
         if HDFC_FOOTER_START in clean_line.replace(" ", ""):
             in_footer_wait = True
             continue
@@ -1094,7 +1150,7 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
             else:
                 continue
 
-        # 4. Block accumulation
+        # 4. Block Accumulation
         if start_recording:
             if HDFC_DATE_START_RE.match(clean_line):
                 if current_block:
@@ -1103,7 +1159,7 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
             elif current_block:
                 current_block += " " + clean_line
 
-    # Flush last block if loop ended without hitting summary marker (big statements)
+    # Flush last block (big statements without summary marker)
     if current_block:
         all_blocks.append(current_block)
 
@@ -1111,6 +1167,7 @@ def _hdfc_extract_blocks(text: str, is_ocr: bool):
 
 
 def _hdfc_parse_row(block_text: str, prev_balance, is_ocr: bool):
+    """Parse a single transaction block — exact match to reference parse_row."""
     tokens = block_text.split()
     if not tokens:
         return None, prev_balance
@@ -1138,7 +1195,6 @@ def _hdfc_parse_row(block_text: str, prev_balance, is_ocr: bool):
         else:
             needs_manual_check = True
 
-    # Build narration by removing dates, amounts, ref
     narration = block_text
     for d in HDFC_DATE_ANY_RE.findall(block_text):
         narration = narration.replace(d, "", 1)
@@ -1146,11 +1202,10 @@ def _hdfc_parse_row(block_text: str, prev_balance, is_ocr: bool):
         narration = narration.replace(a, "", 1)
     if ref_no:
         narration = narration.replace(ref_no, "", 1)
-    narration = re.sub(r"\s+", " ", narration).strip()
 
     return {
         "Date": txn_date,
-        "Narration": narration,
+        "Narration": re.sub(r'\s+', ' ', narration).strip(),
         "Chq./Ref.No": ref_no,
         "WithdrawalAmt": withdrawal,
         "DepositAmt": deposit,
@@ -1243,9 +1298,10 @@ def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bo
 
             # Only extract opening balance from the first chunk
             if idx == 0:
-                open_bal_match = re.search(r"Opening\s+Balance\s+([\d,]+\.\d{2})", full_text, re.IGNORECASE)
+                open_bal_match = re.search(r"Opening\s+Balance\s*:?\s*([\d,]+\.\d{2})", full_text, re.IGNORECASE)
                 running_balance = _hdfc_clean_amount(open_bal_match.group(1)) if open_bal_match else 0.0
                 combined_metadata["opening_balance"] = running_balance
+                print(f"[HDFC] Opening balance: {running_balance}")
 
                 # Extract summary metadata from first chunk text
                 summary_pattern = re.compile(r"(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})")
@@ -1256,6 +1312,12 @@ def parse_hdfc_bank(pdf_path: str, password: Optional[str] = None, force_ocr: bo
                     combined_metadata["exp_cr_sum"] = _hdfc_clean_amount(last_match[3])
 
             blocks = _hdfc_extract_blocks(full_text, is_ocr)
+            print(f"[HDFC] Chunk {idx+1}: method={method}, text_len={len(full_text)}, blocks_found={len(blocks)}")
+
+            # Log first few blocks for debugging OCR quality
+            if is_ocr and blocks:
+                for bi, b in enumerate(blocks[:3]):
+                    print(f"[HDFC-OCR] Sample block {bi}: {b[:150]}")
 
             for b in blocks:
                 row, running_balance = _hdfc_parse_row(b, running_balance, is_ocr)
