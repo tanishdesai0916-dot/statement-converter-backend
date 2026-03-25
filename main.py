@@ -1651,7 +1651,7 @@ def add_axis_total_row(df: pd.DataFrame) -> pd.DataFrame:
 async def convert(
     request: Request,
     file: UploadFile = File(...),
-    mode: str = Form(...),          # "pms" | "kotak" | "aif" | "axis" | "hdfc" | "icici"
+    mode: str = Form(...),          # "pms" | "kotak" | "aif" | "axis" | "hdfc" | "icici" | "sbi"
     sub_mode: str = Form(""),       # "bank" | "cc" (only for kotak)
     password: Optional[str] = Form(None),
 ):
@@ -1938,6 +1938,21 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
             status = "OK"
             match_text = f"Extracted {len(df_icici)} transactions. Deposits: {actual_dep:,.2f}, Withdrawals: {actual_wd:,.2f}"
 
+        # ── BPCL SBI CARD ────────────────────────────────────────────────
+        elif mode == "sbi":
+            df_sbi, problems, total_pages, ext_method = parse_sbi_card(tmp_path, password)
+            if ext_method == "text" and len(df_sbi) < MIN_ROWS:
+                df_retry, problems_retry, pages_retry, method_retry = parse_sbi_card(
+                    tmp_path, password, force_ocr=True,
+                )
+                if len(df_retry) > len(df_sbi):
+                    df_sbi, problems, total_pages, ext_method = df_retry, problems_retry, pages_retry, method_retry
+            df_out = df_sbi
+            detail_total = pd.to_numeric(df_sbi["Amount"], errors="coerce").fillna(0).sum() if not df_sbi.empty else 0
+            method = f"sbi_{ext_method}"
+            status = "OK"
+            match_text = f"Extracted {len(df_sbi)} transactions."
+
         else:
             raise HTTPException(400, f"Unknown mode/sub_mode: {mode}/{sub_mode}")
 
@@ -1991,7 +2006,7 @@ def _convert_sync(tmp_path: str, filename: str, mode: str, sub_mode: str, passwo
                     "xml":   xml_name,
                     "report": f"{stem}_extraction_report.txt",
                 },
-                "mode": "pms" if mode == "pms" else "aif" if mode == "aif" else "axis" if mode == "axis" else "hdfc" if mode == "hdfc" else "icici" if mode == "icici" else sub_mode,
+                "mode": "pms" if mode == "pms" else "aif" if mode == "aif" else "axis" if mode == "axis" else "hdfc" if mode == "hdfc" else "icici" if mode == "icici" else "sbi" if mode == "sbi" else sub_mode,
             },
             "files": {
                 "xlsx": xlsx_b64,
@@ -2720,6 +2735,132 @@ def parse_aif_pdf(pdf_path: str, password: Optional[str] = None, force_ocr: bool
     df, problems = _aif_extract_transactions(lines)
     df_with_total, detail_total = _aif_add_total_row(df)
     return df_with_total, problems, total_pages, detail_total, summary_total, extraction_method
+
+
+# =============================================================================
+# ── BPCL SBI CARD PARSER ─────────────────────────────────────────────────────
+# =============================================================================
+
+SBI_STOP_TRIGGER = "Transactions highlighted in grey color"
+SBI_DATE_PATTERN = re.compile(r"^\d{2}\s[A-Za-z]{3}\s\d{2}")
+SBI_AMOUNT_PATTERN = re.compile(r"([\d,]+\.\d{2})")
+SBI_DRCR_PATTERN = re.compile(r"\b(D|C)\b")
+SBI_COLS = ["Date", "Transaction Details", "Amount", "Dr./Cr."]
+
+
+def _sbi_is_start_line(line: str) -> bool:
+    line_clean = line.lower().replace(" ", "")
+    return (
+        "datetransactiondetailsamount" in line_clean
+        or (
+            "date" in line.lower()
+            and "transaction" in line.lower()
+            and "amount" in line.lower()
+        )
+    )
+
+
+def _sbi_clean_amount(x: str) -> float:
+    return float(x.replace(",", ""))
+
+
+def _sbi_extract_amount_drcr(text: str):
+    drcr = SBI_DRCR_PATTERN.search(text)
+    amounts = SBI_AMOUNT_PATTERN.findall(text)
+    if drcr and amounts:
+        return _sbi_clean_amount(amounts[-1]), drcr.group(1)
+    return None, None
+
+
+def _sbi_remove_last_amount(text: str) -> str:
+    matches = list(SBI_AMOUNT_PATTERN.finditer(text))
+    if not matches:
+        return text
+    last = matches[-1]
+    start, end = last.span()
+    return text[:start] + text[end:]
+
+
+def _sbi_extract_transactions(text: str) -> pd.DataFrame:
+    lines = text.splitlines()
+    parsing = False
+    rows = []
+    current_date = ""
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        # -------- START --------
+        if not parsing:
+            if _sbi_is_start_line(line):
+                for j in range(i, min(i + 10, len(lines))):
+                    if "statement period" in lines[j].lower():
+                        parsing = True
+                        print("[SBI] Parsing started")
+                        break
+            continue
+
+        # -------- STOP --------
+        if SBI_STOP_TRIGGER.lower() in line.lower():
+            print("[SBI] Hard stop triggered")
+            break
+
+        # -------- NEW DATE LINE --------
+        m = SBI_DATE_PATTERN.match(line)
+        if m:
+            date = m.group()
+            current_date = date
+            rest = line[len(date):].strip()
+            amt, drcr = _sbi_extract_amount_drcr(rest)
+            if amt:
+                rest = _sbi_remove_last_amount(rest)
+            if drcr:
+                rest = SBI_DRCR_PATTERN.sub("", rest)
+            rows.append({
+                "Date": current_date,
+                "Transaction Details": rest.strip(),
+                "Amount": amt,
+                "Dr./Cr.": drcr,
+            })
+
+        # -------- CONTINUATION (NEW ROW) --------
+        else:
+            if not current_date:
+                continue
+            amt, drcr = _sbi_extract_amount_drcr(line)
+            clean_line = line
+            if amt:
+                clean_line = _sbi_remove_last_amount(clean_line)
+            if drcr:
+                clean_line = SBI_DRCR_PATTERN.sub("", clean_line)
+            rows.append({
+                "Date": current_date,
+                "Transaction Details": clean_line.strip(),
+                "Amount": amt,
+                "Dr./Cr.": drcr,
+            })
+
+    return pd.DataFrame(rows, columns=SBI_COLS)
+
+
+def parse_sbi_card(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
+    """Parse BPCL SBI Card statement PDF → (df, problems, total_pages, extraction_method)."""
+    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
+    total_pages = len(pages_text)
+
+    full_text = "\n".join(t or "" for t in pages_text)
+
+    df = _sbi_extract_transactions(full_text)
+
+    # Clean up whitespace in Transaction Details
+    if not df.empty:
+        df["Transaction Details"] = df["Transaction Details"].str.replace(r"\s+", " ", regex=True)
+
+    problems = []
+    return df, problems, total_pages, extraction_method
+
 
 
 # =============================================================================
