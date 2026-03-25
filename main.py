@@ -2838,20 +2838,11 @@ def _sbi_extract_transactions(text: str) -> pd.DataFrame:
         # -------- START --------
         if not parsing:
             if _sbi_is_start_line(line):
-                # Try to find "statement period" within 10 lines (like reference)
-                found_period = False
                 for j in range(i, min(i + 10, len(lines))):
                     if "statement period" in lines[j].lower():
-                        found_period = True
+                        parsing = True
+                        print("[SBI] Parsing started")
                         break
-                if found_period:
-                    parsing = True
-                    print("[SBI] Parsing started (with statement period)")
-                else:
-                    # Also start parsing if we see the header line even without
-                    # "statement period" — some PDFs/OCR may not have it
-                    parsing = True
-                    print("[SBI] Parsing started (header only)")
             continue
 
         # -------- STOP --------
