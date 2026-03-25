@@ -2781,6 +2781,49 @@ def _sbi_remove_last_amount(text: str) -> str:
     return text[:start] + text[end:]
 
 
+def _sbi_extract_text_hybrid(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
+    """
+    Hybrid extraction exactly like the reference code:
+    1. Try pdfplumber first
+    2. If text is empty, too short (<100 chars), or missing 'Date' keyword → OCR fallback
+    Returns (full_text, is_ocr, total_pages)
+    """
+    text = ""
+    is_ocr = False
+    total_pages = 0
+
+    if not force_ocr:
+        try:
+            open_kwargs = {"path_or_fp": pdf_path}
+            if password:
+                open_kwargs["password"] = password
+            with pdfplumber.open(**open_kwargs) as pdf:
+                total_pages = len(pdf.pages)
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + "\n"
+        except Exception:
+            text = ""
+
+    # Quality check exactly as reference: not text, too short, or no "Date" keyword
+    if force_ocr or not text or len(text.strip()) < 100 or "Date" not in text:
+        is_ocr = True
+        print("[SBI] Running OCR fallback...")
+        if OCR_AVAILABLE and (shutil.which(GS_EXE) or os.path.exists(GS_EXE)):
+            try:
+                ocr_pages = ocr_pdf(pdf_path, password)
+                ocr_pages = [_normalize_ocr_text(t) for t in ocr_pages]
+                total_pages = max(total_pages, len(ocr_pages))
+                ocr_text = "\n".join(ocr_pages)
+                # Clean OCR artifacts
+                ocr_text = ocr_text.replace("[", "").replace(")", "").replace("|", " ")
+                if ocr_text and len(ocr_text.strip()) > len(text.strip()):
+                    text = ocr_text
+            except Exception as e:
+                print(f"[SBI] OCR failed: {e}")
+
+    return text, is_ocr, total_pages
+
+
 def _sbi_extract_transactions(text: str) -> pd.DataFrame:
     lines = text.splitlines()
     parsing = False
@@ -2795,11 +2838,20 @@ def _sbi_extract_transactions(text: str) -> pd.DataFrame:
         # -------- START --------
         if not parsing:
             if _sbi_is_start_line(line):
+                # Try to find "statement period" within 10 lines (like reference)
+                found_period = False
                 for j in range(i, min(i + 10, len(lines))):
                     if "statement period" in lines[j].lower():
-                        parsing = True
-                        print("[SBI] Parsing started")
+                        found_period = True
                         break
+                if found_period:
+                    parsing = True
+                    print("[SBI] Parsing started (with statement period)")
+                else:
+                    # Also start parsing if we see the header line even without
+                    # "statement period" — some PDFs/OCR may not have it
+                    parsing = True
+                    print("[SBI] Parsing started (header only)")
             continue
 
         # -------- STOP --------
@@ -2847,12 +2899,21 @@ def _sbi_extract_transactions(text: str) -> pd.DataFrame:
 
 def parse_sbi_card(pdf_path: str, password: Optional[str] = None, force_ocr: bool = False):
     """Parse BPCL SBI Card statement PDF → (df, problems, total_pages, extraction_method)."""
-    pages_text, extraction_method = extract_pdf_pages_text(pdf_path, password, force_ocr=force_ocr)
-    total_pages = len(pages_text)
-
-    full_text = "\n".join(t or "" for t in pages_text)
+    # Use own hybrid extraction (pdfplumber first, OCR fallback)
+    full_text, is_ocr, total_pages = _sbi_extract_text_hybrid(pdf_path, password, force_ocr=force_ocr)
+    extraction_method = "ocr" if is_ocr else "text"
 
     df = _sbi_extract_transactions(full_text)
+
+    # If pdfplumber text yielded 0 rows and we haven't tried OCR yet, force OCR
+    if not is_ocr and df.empty:
+        print("[SBI] Text extraction yielded 0 rows, retrying with OCR...")
+        full_text_ocr, _, total_pages_ocr = _sbi_extract_text_hybrid(pdf_path, password, force_ocr=True)
+        df_ocr = _sbi_extract_transactions(full_text_ocr)
+        if len(df_ocr) > len(df):
+            df = df_ocr
+            extraction_method = "ocr"
+            total_pages = max(total_pages, total_pages_ocr)
 
     # Clean up whitespace in Transaction Details
     if not df.empty:
